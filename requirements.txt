@@ -1,0 +1,23 @@
+# --- Physics core (Modules 1-2; tested with mujoco 3.17, Python 3.13) ---
+mujoco>=3.1.6
+numpy>=1.24
+scipy>=1.11
+trimesh>=4.0
+# optional: convex decomposition backend used by MeshImporter(collision="decompose")
+# vhacdx>=0.0.8
+
+# --- RL pipeline (Modules 4-5) ---
+gymnasium>=0.29
+stable-baselines3>=2.3
+torch>=2.1
+onnx>=1.15
+onnxruntime>=1.17
+
+# --- Studio GUI (Module 6: FastAPI + WebSockets + Three.js frontend) ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
+pillow>=10.0
+
+# --- Dev / tests ---
+pytest>=7.4
