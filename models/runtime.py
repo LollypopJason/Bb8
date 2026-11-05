@@ -304,24 +304,56 @@ class SceneStepper:
         self.pushes = alive
 
     # ------------------------------------------------------------- stepping
+    def _build_alignment_lut(self) -> None:
+        """Dense (geom, geom) lookup tables so alignment is vectorised over all contacts."""
+        ng = self.model.ngeom
+        self._lut_site = np.full((ng, ng), -1, dtype=np.int64)
+        self._lut_pair = np.full((ng, ng), -1, dtype=np.int64)
+        self._lut_fb = np.zeros((ng, ng), dtype=np.int64)
+        self._fallback = []
+        for (g, tg), (site, fr) in self._aligned_pairs.items():
+            self._lut_site[g, tg] = site
+            pid = -1
+            for k in range(self.model.npair):
+                if {int(self.model.pair_geom1[k]), int(self.model.pair_geom2[k])} == {g, tg}:
+                    pid = k
+                    break
+            self._lut_pair[g, tg] = pid
+            self._lut_fb[g, tg] = len(self._fallback)
+            self._fallback.append(np.array(fr, dtype=float))
+        self._fallback_arr = np.array(self._fallback) if self._fallback else np.zeros((0, 5))
+
     def _align_contact_frames(self) -> None:
         d = self.data
-        for i in range(d.ncon):
-            c = d.contact[i]
-            hit = self._aligned_pairs.get((int(c.geom1), int(c.geom2)))
-            if hit is None:
-                continue
-            site, friction = hit
-            n = np.array(c.frame[:3])
-            t = d.site_xmat[site].reshape(3, 3)[:, 0]
-            t = t - n * float(t @ n)
-            norm = float(np.linalg.norm(t))
-            if norm < 1e-9:
-                continue
-            t /= norm
-            c.frame[3:6] = t
-            c.frame[6:9] = np.cross(n, t)
-            c.friction[:] = friction
+        if d.ncon == 0:
+            return
+        if not hasattr(self, "_lut_site"):
+            self._build_alignment_lut()
+        con = d.contact
+        g1, g2 = con.geom1, con.geom2
+        sites = self._lut_site[g1, g2]
+        idx = np.nonzero(sites >= 0)[0]
+        if idx.size == 0:
+            return
+        frame = con.frame
+        n = frame[idx, 0:3]
+        t = d.site_xmat[sites[idx]].reshape(-1, 3, 3)[:, :, 0]
+        t = t - n * np.einsum("ij,ij->i", t, n)[:, None]
+        norm = np.sqrt(np.einsum("ij,ij->i", t, t))
+        ok = norm > 1e-9
+        idx, n, t = idx[ok], n[ok], t[ok] / norm[ok, None]
+        b = np.empty_like(t)                      # n x t without np.cross overhead
+        b[:, 0] = n[:, 1] * t[:, 2] - n[:, 2] * t[:, 1]
+        b[:, 1] = n[:, 2] * t[:, 0] - n[:, 0] * t[:, 2]
+        b[:, 2] = n[:, 0] * t[:, 1] - n[:, 1] * t[:, 0]
+        frame[idx, 3:6] = t
+        frame[idx, 6:9] = b
+        pids = self._lut_pair[g1[idx], g2[idx]]
+        fr = self._fallback_arr[self._lut_fb[g1[idx], g2[idx]]]
+        live = pids >= 0
+        if np.any(live):
+            fr[live] = self.model.pair_friction[pids[live]]
+        con.friction[idx] = fr
 
     def _apply_magnets_to_qfrc_applied(self) -> None:
         """Temporarily add the magnet forces to ``qfrc_applied`` (removed again after the step)."""
