@@ -269,7 +269,7 @@ def test_serial_mcu_over_pty_ramp_and_watchdog():
         t = mcu.wait_for_telemetry()
         assert t.watchdog and not t.enabled
         # the spin test drives each wheel and reports the encoder direction
-        cfg = RobotConfig({"serial_port": emu.port})
+        cfg = RobotConfig({"serial_port": emu.port, "odometry_source": "mcu_encoders"})
         res = spin_test(cfg, 3, speed=1.0, seconds=0.2, mcu=mcu)
         assert all(r["step_delta"] > 0 and r["suggested_encoder_sign"] == 1 for r in res)
         mcu.close()
@@ -283,12 +283,14 @@ def _max_tilt(io, after=0.0):
 
 
 @pytest.mark.parametrize("signs", [
-    {},
-    {"motor_sign": [1, -1, 1], "encoder_sign": [-1, 1, -1]},
-    {"use_encoders": False, "motor_sign": [-1, 1, 1], "encoder_sign": [1, 1, 1]},
+    {},                                                                    # Arduino IMU + step odometry
+    {"motor_sign": [-1, 1, -1]},
+    {"odometry_source": "mcu_encoders", "motor_sign": [1, -1, 1], "encoder_sign": [-1, 1, -1]},
+    {"imu": {"type": "bno085"}},                                           # on-chip fusion noise model
 ])
 def test_sil_pid_balances_with_pushes(bundles, signs):
     cfg = RobotConfig(dict({"motor_sign": [1, 1, 1], "encoder_sign": [1, 1, 1]}, **signs))
+    cfg.validate(3)
     pushes = [(3.0, [6.0, 0.0, 0.0]), (6.0, [0.0, -6.0, 0.0])]
     runner, io = run_sil(bundles["plain"], "pid", 10.0, cfg, pushes)
     assert runner.mode == ARMED, runner.fault_reason
@@ -350,3 +352,200 @@ def test_export_rejects_torque_drive(tmp_path):
     p.head.motor.control_mode = ControlMode.TORQUE
     with pytest.raises(ValueError):
         build_bundle(str(tmp_path / "b"), "pid", params=p)
+
+
+# --------------------------------------------------------------------------- Arduino IMU + Jetson GPIO stepgen
+def test_header_copies_identical():
+    paths = [os.path.join(ROOT, "deploy", d, "bb8_protocol.h") for d in
+             ("firmware/bb8_mcu", "firmware/bb8_imu", "jetson_stepgen")]
+    blobs = [open(p, "rb").read() for p in paths]
+    assert blobs[0] == blobs[1] == blobs[2]
+
+
+def test_imu_firmware_frames(tmp_path):
+    if shutil.which("g++") is None:
+        pytest.skip("g++ not available")
+    exe = str(tmp_path / "imu_fw")
+    subprocess.run(["g++", "-std=c++11", "-Wall", "-Wextra", "-Werror", "-Ihost_stubs", "-Ibb8_imu", "-x", "c++",
+                    "host_stubs/main_imu.cpp", "-o", exe], check=True, cwd=FIRMWARE)
+    lines = subprocess.run([exe], capture_output=True, text=True, check=True).stdout.split()
+    parser = P.StreamParser()
+    frames = [P.decode(*f) for line in lines for f in parser.feed(bytes.fromhex(line))]
+    assert len(frames) == 3 and [f.seq for f in frames] == [0, 1, 2]
+    assert frames[0].accel[2] == pytest.approx(9.80665, rel=1e-3)        # 8192 LSB at +-4 g = 1 g
+    assert frames[0].gyro == [0.0, 0.0, 0.0] and frames[0].encoders == []
+
+
+def test_arduino_imu_driver_over_pty():
+    pytest.importorskip("serial")
+    import threading
+    import tty
+
+    from deploy.runtime.imu import ArduinoImu, ImuTimeout
+    from deploy.runtime.mathutil import quat_to_mat, zyx_angles
+
+    master, slave = os.openpty()
+    tty.setraw(master)
+    tty.setraw(slave)
+    stop = threading.Event()
+    pitch = math.radians(8.0)
+    bias = np.array([0.02, -0.01, 0.005])
+
+    def board():
+        seq, us = 0, 0
+        while not stop.is_set():
+            accel = 9.81 * np.array([-math.sin(pitch), 0.0, math.cos(pitch)])
+            os.write(master, P.encode_imu(seq, us, bias, accel, [seq, -seq, 2 * seq]))
+            seq, us = seq + 1, (us + 2404) & 0xFFFFFFFF                        # 416 Hz
+            time.sleep(0.0024)
+
+    th = threading.Thread(target=board, daemon=True)
+    th.start()
+    try:
+        imu = ArduinoImu(os.ttyname(slave), fusion_kp=2.0, timeout_s=0.1)
+        imu.gyro_bias = bias                                                  # as set from robot.json
+        imu.wait_ready()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.5:
+            q, g, a, _ = imu.read()
+            time.sleep(0.01)
+        _, p, r = zyx_angles(quat_to_mat(q))
+        assert p == pytest.approx(pitch, abs=math.radians(0.5)) and abs(r) < math.radians(0.5)
+        assert np.allclose(g, 0.0, atol=1e-6)                                 # bias removed before fusion
+        assert imu.encoders[1] == -imu.encoders[0] and imu.samples > 300 and imu.dropped == 0
+        stop.set()
+        th.join()
+        imu.read()                       # drains frames still buffered in the serial line
+        time.sleep(0.2)
+        with pytest.raises(ImuTimeout):
+            imu.read()
+    finally:
+        stop.set()
+        os.close(master)
+        os.close(slave)
+
+
+@pytest.fixture(scope="module")
+def stepgen_bin(tmp_path_factory):
+    if shutil.which("gcc") is None:
+        pytest.skip("gcc not available")
+    exe = str(tmp_path_factory.mktemp("stepgen") / "bb8_stepgen")
+    subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-std=gnu11", "-o", exe, "bb8_stepgen.c", "-lm"],
+                   check=True, cwd=os.path.join(ROOT, "deploy", "jetson_stepgen"))
+    return exe
+
+
+def _start_stepgen(exe, sock, extra=()):
+    proc = subprocess.Popen([exe, "--socket", sock] + list(extra), stderr=subprocess.PIPE, text=True)
+    from deploy.runtime.link import SocketLink
+    from deploy.runtime.mcu import SerialMCU
+
+    mcu = SerialMCU(None, n_motors=3, max_accel_steps=20000.0, watchdog_ms=100, ser=SocketLink(sock))
+    return proc, mcu
+
+
+def _drive(mcu, rates, seconds, enable=True):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        mcu.send(rates, enable)
+        mcu.poll()
+        time.sleep(0.01)
+    return mcu.wait_for_telemetry()
+
+
+def test_stepgen_daemon_sim(stepgen_bin, tmp_path):
+    proc, mcu = _start_stepgen(stepgen_bin, str(tmp_path / "sg.sock"), ["--sim"])
+    try:
+        mcu.configure()
+        t = _drive(mcu, [0.0, 0.0, 0.0], 0.05, enable=False)
+        assert not t.enabled and t.steps == [0, 0, 0]
+        t = _drive(mcu, [2000.0, -1000.0, 0.0], 0.6)
+        # 0.1 s ramp at 20000 steps/s^2 then cruise: ~1100 / -550 steps after 0.6 s
+        assert t.enabled and 900 < t.steps[0] < 1300 and -650 < t.steps[1] < -450 and t.steps[2] == 0
+        assert t.encoders == t.steps                                          # no encoders on the Jetson
+        time.sleep(0.4)                                                       # host goes silent
+        t = mcu.wait_for_telemetry()
+        assert t.watchdog and not t.enabled
+        frozen = t.steps
+        time.sleep(0.1)
+        assert mcu.wait_for_telemetry().steps == frozen                       # stopped
+        t = _drive(mcu, [500.0, 0.0, 0.0], 0.2)
+        assert t.enabled and not t.watchdog                                   # a new command re-enables
+        mcu.ser.close()                                                       # client disconnects ...
+        time.sleep(0.3)
+        from deploy.runtime.link import SocketLink
+
+        mcu.ser = SocketLink(str(tmp_path / "sg.sock"))                        # ... the daemon stopped the motors
+        t = _drive(mcu, [0.0, 0.0, 0.0], 0.05, enable=False)
+        assert not t.enabled
+    finally:
+        proc.terminate()
+        assert proc.wait(timeout=5) == 0
+        assert "drivers disabled" in proc.stderr.read()
+
+
+def test_stepgen_daemon_sysfs_backend(stepgen_bin, tmp_path):
+    root = tmp_path / "gpio"
+    root.mkdir()
+    (root / "export").write_text("")
+    pins = {"step": [216, 79, 232], "dir": [50, 194, 15], "enable": 13}
+    for n in pins["step"] + pins["dir"] + [pins["enable"]]:
+        d = root / f"gpio{n}"
+        d.mkdir()
+        (d / "direction").write_text("in")
+        (d / "value").write_text("0")
+    proc, mcu = _start_stepgen(stepgen_bin, str(tmp_path / "sg.sock"), ["--gpio-root", str(root), "--cpu", "0"])
+    try:
+        mcu.configure()
+        t = _drive(mcu, [-800.0, 400.0, 300.0], 0.3)
+        assert t.steps[0] < -50 and t.steps[1] > 25 and t.steps[2] > 20
+        for n in pins["step"] + pins["dir"] + [pins["enable"]]:
+            assert (root / f"gpio{n}" / "direction").read_text() == "out"
+        assert (root / "gpio13" / "value").read_text() == "0"                # enabled (active low)
+        assert (root / "gpio50" / "value").read_text() == "0"                # motor 0 turning backwards
+        assert (root / "gpio194" / "value").read_text() == "1"
+    finally:
+        proc.terminate()
+        assert proc.wait(timeout=5) == 0
+    assert (root / "gpio13" / "value").read_text() == "1"                    # disabled on exit
+    assert all((root / f"gpio{n}" / "value").read_text() == "0" for n in pins["step"])
+
+
+def test_hardware_io_with_stepgen_and_arduino_imu(stepgen_bin, tmp_path, bundles):
+    """HardwareIO wiring: daemon over the Unix socket + Arduino IMU on a pty, DISARMED loop."""
+    pytest.importorskip("serial")
+    import threading
+    import tty
+
+    from deploy.runtime.runner import HardwareIO
+
+    sock = str(tmp_path / "sg.sock")
+    proc = subprocess.Popen([stepgen_bin, "--socket", sock, "--sim"], stderr=subprocess.PIPE, text=True)
+    master, slave = os.openpty()
+    tty.setraw(master)
+    tty.setraw(slave)
+    stop = threading.Event()
+
+    def board():
+        seq = 0
+        while not stop.is_set():
+            os.write(master, P.encode_imu(seq, seq * 2404, [0, 0, 0], [0, 0, 9.81]))
+            seq += 1
+            time.sleep(0.0024)
+
+    th = threading.Thread(target=board, daemon=True)
+    th.start()
+    try:
+        cfg = RobotConfig({"stepgen_socket": sock, "imu": {"port": os.ttyname(slave)}})
+        bundle = Bundle.load(bundles["plain"])
+        io = HardwareIO(cfg, 3)
+        runner = BalanceRunner(bundle, cfg, io, "pid", auto_arm=False)
+        runner.run(max_ticks=50, status_every=0)
+        assert runner.mode == "DISARMED" and runner.state is not None and runner.state.tilt_deg < 1.0
+        assert io.overruns < 10
+    finally:
+        stop.set()
+        proc.terminate()
+        proc.wait(timeout=5)
+        os.close(master)
+        os.close(slave)

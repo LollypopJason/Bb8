@@ -1,9 +1,14 @@
 """BB-8 balance runner for the Jetson Nano (Python >= 3.6, numpy + pyserial).
 
+Hardware (default): Arduino Nano 33 IoT IMU on USB (``firmware/bb8_imu``) and stepper
+drivers on Jetson GPIO driven by the ``jetson_stepgen/bb8_stepgen`` daemon. A Teensy
+(``firmware/bb8_mcu``) and I2C IMUs (BNO085 / MPU6050) are supported alternatives.
+
 Usage on the robot::
 
     python3 -m deploy.runtime.runner write-config robot.json        # then edit ports / signs / IMU
     python3 -m deploy.runtime.runner calibrate --config robot.json  # robot held upright and still
+    sudo ./deploy/jetson_stepgen/bb8_stepgen &                      # or the systemd service
     python3 -m deploy.runtime.runner spin-test --config robot.json  # robot OFF the ball: checks signs
     python3 -m deploy.runtime.runner run --bundle bundle/ --config robot.json --controller pid
 
@@ -44,17 +49,15 @@ DISARMED, ARMED, FAULT = "DISARMED", "ARMED", "FAULT"
 
 # --------------------------------------------------------------------------- IO backends
 class HardwareIO(object):
-    """Real robot: microcontroller over serial + I2C IMU, real-time tick scheduling."""
+    """Real robot: step generator (Jetson GPIO daemon or USB MCU) + IMU, real-time tick scheduling."""
 
     def __init__(self, cfg, n_wheels, mcu=None, imu=None):
         from .imu import make_imu
-        from .mcu import SerialMCU
+        from .mcu import make_motor_link
 
         self.cfg = cfg
         self.n = n_wheels
-        self.mcu = mcu or SerialMCU(cfg["serial_port"], cfg["baud"], n_wheels,
-                                    max_accel_steps=cfg["max_accel"] * cfg.steps_per_rad,
-                                    watchdog_ms=cfg["watchdog_ms"])
+        self.mcu = mcu or make_motor_link(cfg, n_wheels)
         self.imu = imu or make_imu(cfg)
         self.period = 1.0 / cfg["control_rate_hz"]
         self.next_t = None
@@ -67,10 +70,23 @@ class HardwareIO(object):
         self.next_t = time.monotonic()
 
     def read(self):
+        from .imu import ImuTimeout
+
         telem = self.mcu.poll()
         fresh = self.mcu.telem_time is not None and time.monotonic() - self.mcu.telem_time < \
             self.cfg["safety"]["telemetry_timeout_s"]
-        return self.imu.read(), (telem if fresh else None)
+        try:
+            imu = self.imu.read()
+        except ImuTimeout:
+            imu = None
+        return imu, (telem if fresh else None)
+
+    def odometry(self, telem):
+        """(counts, microsecond clock) of the configured odometry source."""
+        src = self.cfg["odometry_source"]
+        if src == "imu_encoders":
+            return self.imu.raw.encoders, self.imu.raw.encoder_us
+        return (telem.encoders if src == "mcu_encoders" else telem.steps), telem.mcu_us
 
     def write(self, step_rates, enable):
         self.mcu.send(step_rates, enable)
@@ -140,7 +156,7 @@ class BalanceRunner(object):
         self.target = Target.from_bundle(bundle)
         tau = float(bundle.section("robot").get("odometry_velocity_tau", 0.0))
         self.estimator = OdometryEstimator(bundle.J, bundle.R, bundle.active, tau)
-        use_enc = cfg["use_encoders"]
+        use_enc = cfg["odometry_source"] != "steps"
         k = cfg.counts_per_rad if use_enc else cfg.steps_per_rad
         self.wheels = WheelSpeedEstimator(k, cfg["encoder_sign"] if use_enc else cfg["motor_sign"])
         self.motor_sign = np.asarray(cfg["motor_sign"], dtype=float)
@@ -221,12 +237,17 @@ class BalanceRunner(object):
         if "arm" in events:
             self.request_arm()
 
-        if telem is None:
-            self._disarm("no telemetry from the microcontroller")
+        if telem is None or imu is None:
+            self._disarm("no telemetry from the step generator" if telem is None else "no IMU data")
             self.io.write([0.0] * self.n, False)
             self._log(now, None, np.zeros(self.n))
             return
-        speeds = self.wheels.update(telem.encoders if self.cfg["use_encoders"] else telem.steps, telem.mcu_us)
+        counts, clock_us = self.io.odometry(telem)
+        if len(counts) != self.n:
+            self._disarm("odometry source reports %d wheels, expected %d" % (len(counts), self.n))
+            self.io.write([0.0] * self.n, False)
+            return
+        speeds = self.wheels.update(counts, clock_us)
         state = self.estimator.update(imu.rot, imu.gyro, speeds, self.dt, self.target.position)
         self.state = state
         tilt = state.tilt_deg
@@ -319,6 +340,8 @@ def calibrate(cfg, seconds=3.0, imu_raw=None):
     from .mathutil import zyx_angles
 
     imu = imu_raw or make_imu(cfg).raw
+    if hasattr(imu, "gyro_bias"):
+        imu.gyro_bias = np.zeros(3)          # measure the raw bias
     gyros, rolls, pitches = [], [], []
     from .mathutil import euler_xyz_deg_to_mat, quat_to_mat
 
@@ -338,20 +361,37 @@ def calibrate(cfg, seconds=3.0, imu_raw=None):
     return cfg
 
 
-def spin_test(cfg, n_wheels, speed=1.0, seconds=1.0, mcu=None):
-    """Spin each wheel at +speed rad/s (robot OFF the ball) and report the encoder direction."""
-    from .mcu import SerialMCU
+def spin_test(cfg, n_wheels, speed=1.0, seconds=1.0, mcu=None, imu_raw=None):
+    """Spin each wheel at +speed rad/s (robot OFF the ball); report step and encoder deltas.
 
-    mcu = mcu or SerialMCU(cfg["serial_port"], cfg["baud"], n_wheels, cfg["max_accel"] * cfg.steps_per_rad,
-                           cfg["watchdog_ms"])
+    With odometry from steps there is no encoder: only check visually that each wheel turns the
+    right way (see deploy/README.md) and fix ``motor_sign``.
+    """
+    from .mcu import make_motor_link
+
+    mcu = mcu or make_motor_link(cfg, n_wheels)
+    src = cfg["odometry_source"]
+    if src == "imu_encoders" and imu_raw is None:
+        from .imu import ArduinoImu
+
+        imu_raw = ArduinoImu(cfg["imu"]["port"], cfg["imu"]["baud"])
+        imu_raw.wait_ready()
+
+    def counts(telem):
+        if src == "imu_encoders":
+            imu_raw.read()
+            return list(imu_raw.encoders)
+        return list(telem.encoders if src == "mcu_encoders" else telem.steps)
+
     mcu.configure()
     mcu.send([0.0] * n_wheels, False)
-    t0 = mcu.wait_for_telemetry()
+    mcu.wait_for_telemetry()
     results = []
     for i in range(n_wheels):
         rates = [0.0] * n_wheels
         rates[i] = cfg["motor_sign"][i] * speed * cfg.steps_per_rad
         start = mcu.wait_for_telemetry()
+        c0 = counts(start)
         t_end = time.monotonic() + seconds
         while time.monotonic() < t_end:
             mcu.send(rates, True)
@@ -359,12 +399,15 @@ def spin_test(cfg, n_wheels, speed=1.0, seconds=1.0, mcu=None):
             time.sleep(0.01)
         mcu.send([0.0] * n_wheels, True)
         end = mcu.wait_for_telemetry()
-        d_enc = end.encoders[i] - start.encoders[i]
+        c1 = counts(end)
         d_steps = end.steps[i] - start.steps[i]
-        results.append({"wheel": i, "encoder_delta": d_enc, "step_delta": d_steps,
-                        "suggested_encoder_sign": int(np.sign(d_enc) * np.sign(d_steps * cfg["motor_sign"][i]) or 1)})
+        res = {"wheel": i, "step_delta": d_steps}
+        if src != "steps":
+            d_enc = c1[i] - c0[i]
+            res["encoder_delta"] = d_enc
+            res["suggested_encoder_sign"] = int(np.sign(d_enc) * np.sign(d_steps * cfg["motor_sign"][i]) or 1)
+        results.append(res)
     mcu.send([0.0] * n_wheels, False)
-    del t0
     return results
 
 
@@ -405,8 +448,8 @@ def main(argv=None):
         print("robot must be OFF the ball. Spinning each wheel at +1 rad/s for 1 s ...")
         for res in spin_test(cfg, args.wheels):
             print(res)
-        print("Check that each wheel turned in its +axle direction (see deploy/README.md); fix motor_sign "
-              "first, then set encoder_sign to the suggestion.")
+        print("Each wheel must turn so that its ball-contact point moves CLOCKWISE seen from above the head; "
+              "fix motor_sign first, then (with encoders) set encoder_sign to the suggestion.")
         return 0
     if args.cmd == "run":
         cfg = RobotConfig.load(args.config)

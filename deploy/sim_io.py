@@ -36,7 +36,7 @@ if _ROOT not in sys.path:
 from deploy.runtime import protocol as P  # noqa: E402
 from deploy.runtime.bundle import Bundle  # noqa: E402
 from deploy.runtime.config import RobotConfig  # noqa: E402
-from deploy.runtime.imu import ImuSample  # noqa: E402
+from deploy.runtime.imu import ComplementaryFilter, ImuSample  # noqa: E402
 from deploy.runtime.runner import BalanceRunner  # noqa: E402
 
 
@@ -94,9 +94,12 @@ class SimIO:
     """IO backend for :class:`BalanceRunner` on the MuJoCo BB-8."""
 
     def __init__(self, bundle: Bundle, cfg: RobotConfig, env_config=None, seed: int = 0,
-                 detent_torque: float = 0.02, hold_until_armed: bool = True) -> None:
+                 detent_torque: float = 0.02, hold_until_armed: bool = True,
+                 residual_gyro_bias_std: float = 0.002) -> None:
         """``hold_until_armed``: like an operator, keep the robot upright and still until the
-        drivers are first enabled (the unpowered head would otherwise fall off the ball)."""
+        drivers are first enabled (the unpowered head would otherwise fall off the ball).
+        ``residual_gyro_bias_std``: gyro bias left after calibration [rad/s]; with Jetson-side
+        fusion it becomes a steady tilt error of bias / fusion_kp."""
         from config.composite_ball_params import params_from_dict
         from envs.ball_balancer_env import BallBalancerEnv, EnvConfig
 
@@ -110,8 +113,13 @@ class SimIO:
         env_config.max_tilt_deg = 1e9                 # the runner's safety logic decides, not the env
         env_config.max_ball_distance = 1e9
         env_config.episode_seconds = 1e9
+        env_config.initial_tilt_deg = min(env_config.initial_tilt_deg, 1.0)   # held roughly upright ...
         self.env = BallBalancerEnv(env_config)
         self.env.reset(seed=seed)
+        if hold_until_armed:
+            self.env.data.qvel[:] = 0.0                                        # ... and still
+            if self.env.model.na:
+                self.env.data.act[:] = 0.0
         self.cfg = cfg
         self.n = bundle.n_wheels
         self.fw = FirmwareModel(self.n, cfg["max_accel"] * cfg.steps_per_rad, cfg["watchdog_ms"])
@@ -124,6 +132,24 @@ class SimIO:
         self.wheel_qadr = np.array([m.jnt_qposadr[m.joint(w.joint).id] for w in self.env.meta.wheels])
         self.dt = self.env.control_dt
         self.physics_dt = m.opt.timestep
+        # IMU model: Jetson-side fusion of raw gyro/accel (arduino, mpu6050) at physics rate,
+        # or the sensor bus' orientation-noise model (bno085, fused on-chip)
+        self.fusion = cfg["imu"]["type"] in ("arduino", "mpu6050")
+        hw = self.env.cfg.hardware
+        self.rng = np.random.default_rng(seed + 17)
+        noisy = hw.noise_enabled
+        self.imu_noise = (hw.imu.gyro_noise_std if noisy else 0.0, hw.imu.accel_noise_std if noisy else 0.0)
+        # gyro bias left after `runner calibrate` (the raw bias, hw.imu.gyro_bias_std, is calibrated out)
+        self.residual_bias = self.rng.normal(0.0, residual_gyro_bias_std, 3) if noisy else np.zeros(3)
+        self.filter = ComplementaryFilter(kp=cfg["imu"]["fusion_kp"])
+        base = self.env.meta.imu_site
+        sid = lambda name: (m.sensor_adr[m.sensor(name).id], 3)          # noqa: E731
+        self._gyro_adr, self._acc_adr = sid(base + "_gyro")[0], sid(base + "_acc")[0]
+        self._last_gyro, self._last_acc = np.zeros(3), np.array([0.0, 0.0, 9.81])
+        import mujoco as _mj
+
+        _mj.mj_forward(m, self.env.data)
+        self._imu_sample(held=hold_until_armed)
         self.frame_skip = self.env.frame_skip
         self.pushes: List[tuple] = []          # (time, body, force, duration)
         self._last_us = self._now_us()
@@ -136,10 +162,30 @@ class SimIO:
     def now(self) -> float:
         return float(self.env.data.time)
 
+    def _imu_sample(self, held: bool = False) -> None:
+        sd = self.env.data.sensordata
+        gn, an = self.imu_noise
+        if held:      # held still by hand: the IMU feels only gravity (frozen sim data may hold contact accels)
+            H = self.env.data.xmat[self.env.bbm.head_id].reshape(3, 3)
+            g_true, a_true = np.zeros(3), H.T @ np.array([0.0, 0.0, 9.81])
+        else:
+            g_true, a_true = sd[self._gyro_adr:self._gyro_adr + 3], sd[self._acc_adr:self._acc_adr + 3]
+        g = g_true + self.residual_bias + self.rng.normal(0.0, gn, 3)
+        a = a_true + self.rng.normal(0.0, an, 3)
+        self._last_gyro, self._last_acc = g, a
+        self.filter.update(g, a, self.physics_dt)     # the residual (post-calibration) bias stays in
+
+    def odometry(self, telem):
+        src = self.cfg["odometry_source"]
+        return (telem.steps if src == "steps" else telem.encoders), telem.mcu_us
+
     def read(self):
         env = self.env
-        r = env.sensors.read(env.data)
-        imu = ImuSample(r.imu_quat, r.gyro, r.accel, r.time)
+        if self.fusion:
+            imu = ImuSample(self.filter.q.copy(), self._last_gyro.copy(), self._last_acc.copy(), float(env.data.time))
+        else:
+            r = env.sensors.read(env.data)
+            imu = ImuSample(r.imu_quat, r.gyro, r.accel, r.time)
         angles = env.data.qpos[self.wheel_qadr]
         enc = np.floor(self.enc_sign * angles * self.cfg.counts_per_rad).astype(np.int64)
         steps = np.floor(self.fw.position).astype(np.int64)
@@ -164,6 +210,8 @@ class SimIO:
                     self.holding = False              # released: physics takes over
                     break
                 d.time += self.physics_dt             # held still by hand: time passes, nothing moves
+                if self.fusion:
+                    self._imu_sample(held=True)
             if self.holding:
                 self.log.append({"t": float(d.time), "tilt_deg": 0.0, "ball_xy": d.xpos[env.bbm.ball_id][:2].copy(),
                                  "enabled": False})
@@ -180,6 +228,8 @@ class SimIO:
                 m.actuator_forcerange[env.actuators.wheel_act, 1] = self.detent
             env.stepper.step(1)
             env.physics_step += 1
+            if self.fusion:
+                self._imu_sample()
         truth = env.bbm.measure(d)
         self.log.append({"t": float(d.time), "tilt_deg": math.degrees(max(abs(truth.roll), abs(truth.pitch))),
                          "ball_xy": d.xpos[env.bbm.ball_id][:2].copy(), "enabled": self.fw.enabled})
@@ -196,6 +246,7 @@ def run_sil(bundle_dir: str, controller: Optional[str] = None, seconds: float = 
     """Run the robot runtime against the simulator. Returns (runner, io)."""
     bundle = Bundle.load(bundle_dir)
     cfg = cfg or RobotConfig({"motor_sign": [1] * bundle.n_wheels, "encoder_sign": [1] * bundle.n_wheels})
+    cfg.validate(bundle.n_wheels)
     io = SimIO(bundle, cfg, env_config, seed)
     for t, f in pushes:
         io.schedule_push(t, f)

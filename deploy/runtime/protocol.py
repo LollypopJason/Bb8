@@ -14,7 +14,12 @@ type        dir     payload
 0x01 CMD    host>   u16 seq, u8 flags (bit0 enable), u8 n, f32 step_rate[n] [steps/s]
 0x02 CFG    host>   f32 max_accel [steps/s^2], u16 watchdog_ms, u8 n
 0x81 TELEM  >host   u16 seq_echo, u32 mcu_us, u8 flags, u8 n, i32 encoder[n], i32 steps[n]
+0x83 IMU    >host   u16 seq, u32 us, f32 gyro[3] [rad/s], f32 accel[3] [m/s^2], u8 n,
+                    i32 encoder[n]            (Arduino IMU board; n = 0 without encoders)
 ==========  ======  ==================================================================
+
+CMD / CFG / TELEM are spoken by the stepper back end (``jetson_stepgen`` daemon over a
+Unix socket, or a Teensy over USB serial); IMU frames come from the Arduino IMU board.
 
 TELEM flags: bit0 drivers enabled, bit1 watchdog tripped, bit2 configured.
 """
@@ -25,6 +30,7 @@ SYNC = b"\xAA\x55"
 T_CMD = 0x01
 T_CFG = 0x02
 T_TELEM = 0x81
+T_IMU = 0x83
 MAX_MOTORS = 4
 
 FLAG_ENABLE = 0x01
@@ -66,6 +72,20 @@ def encode_telem(seq_echo, mcu_us, flags, encoders, steps):
     payload = struct.pack("<HIBB", seq_echo & 0xFFFF, mcu_us & 0xFFFFFFFF, flags, n)
     payload += struct.pack("<%di" % n, *encoders) + struct.pack("<%di" % n, *steps)
     return frame(T_TELEM, payload)
+
+
+def encode_imu(seq, us, gyro, accel, encoders=()):
+    payload = struct.pack("<HI3f3fB", seq & 0xFFFF, us & 0xFFFFFFFF, *(list(gyro) + list(accel) + [len(encoders)]))
+    if encoders:
+        payload += struct.pack("<%di" % len(encoders), *encoders)
+    return frame(T_IMU, payload)
+
+
+class ImuFrame(object):
+    __slots__ = ("seq", "us", "gyro", "accel", "encoders")
+
+    def __init__(self, seq, us, gyro, accel, encoders):
+        self.seq, self.us, self.gyro, self.accel, self.encoders = seq, us, gyro, accel, encoders
 
 
 class Cmd(object):
@@ -117,6 +137,13 @@ def decode(ftype, payload):
             enc = list(struct.unpack_from("<%di" % n, payload, 8))
             steps = list(struct.unpack_from("<%di" % n, payload, 8 + 4 * n))
             return Telem(seq, us, flags, enc, steps)
+        if ftype == T_IMU:
+            vals = struct.unpack_from("<HI3f3fB", payload)
+            n = vals[-1]
+            if n > MAX_MOTORS or len(payload) != 31 + 4 * n:
+                raise ValueError("bad IMU length")
+            enc = list(struct.unpack_from("<%di" % n, payload, 31)) if n else []
+            return ImuFrame(vals[0], vals[1], list(vals[2:5]), list(vals[5:8]), enc)
     except struct.error as exc:
         raise ValueError(str(exc))
     raise ValueError("unknown frame type 0x%02x" % ftype)

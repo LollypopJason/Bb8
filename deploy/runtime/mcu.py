@@ -33,7 +33,7 @@ class SerialMCU(object):
     def poll(self):
         """Read everything available; returns the newest telemetry (or the previous one)."""
         waiting = getattr(self.ser, "in_waiting", 0)
-        data = self.ser.read(waiting or 1)
+        data = self.ser.read(max(int(waiting), 1))
         if data:
             for ftype, payload in self.parser.feed(data):
                 if ftype != P.T_TELEM:
@@ -60,5 +60,18 @@ class SerialMCU(object):
     def close(self):
         try:
             self.send([0.0] * self.n, False)
+        except (OSError, ValueError):
+            pass
         finally:
             self.ser.close()
+
+
+def make_motor_link(cfg, n_motors):
+    """SerialMCU for the configured stepper back end (Jetson GPIO daemon or USB microcontroller)."""
+    kw = dict(n_motors=n_motors, max_accel_steps=cfg["max_accel"] * cfg.steps_per_rad,
+              watchdog_ms=cfg["watchdog_ms"])
+    if cfg["stepper_backend"] == "jetson_gpio":
+        from .link import SocketLink
+
+        return SerialMCU(None, ser=SocketLink(cfg["stepgen_socket"]), **kw)
+    return SerialMCU(cfg["serial_port"], cfg["baud"], **kw)

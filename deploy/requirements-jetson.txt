@@ -1,8 +1,8 @@
 # Robot-side runtime (Jetson Nano, Python >= 3.6). No MuJoCo / torch needed.
 numpy>=1.13
-pyserial>=3.4
-smbus2>=0.4            # MPU6050 driver
-# BNO085 driver (Adafruit Blinka; recent releases need Python >= 3.7):
-adafruit-blinka
-adafruit-circuitpython-bno08x
-# optional: onnxruntime (NVIDIA Jetson Zoo wheel) for --onnx; numpy inference is the default
+pyserial>=3.4          # Arduino IMU (and the optional Teensy back end)
+# The stepper daemon (deploy/jetson_stepgen) is plain C: `make` needs only build-essential.
+# Optional I2C IMU alternatives:
+#   smbus2>=0.4                                         (imu.type = mpu6050)
+#   adafruit-blinka adafruit-circuitpython-bno08x       (imu.type = bno085; recent releases need Python >= 3.7)
+# Optional: onnxruntime (NVIDIA Jetson Zoo wheel) for --onnx; numpy inference is the default.

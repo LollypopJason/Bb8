@@ -6,6 +6,9 @@
 //   0x01 CMD   host->mcu  u16 seq, u8 flags (bit0 enable), u8 n, f32 step_rate[n]   (steps/s)
 //   0x02 CFG   host->mcu  f32 max_accel (steps/s^2), u16 watchdog_ms, u8 n
 //   0x81 TELEM mcu->host  u16 seq_echo, u32 mcu_us, u8 flags, u8 n, i32 encoder[n], i32 steps[n]
+//   0x83 IMU   imu->host  u16 seq, u32 us, f32 gyro[3] (rad/s), f32 accel[3] (m/s^2), u8 n, i32 encoder[n]
+// The same header is used by bb8_mcu (Teensy), bb8_imu (Arduino) and jetson_stepgen (Jetson daemon);
+// tests/test_deploy.py checks that the copies are identical.
 #ifndef BB8_PROTOCOL_H
 #define BB8_PROTOCOL_H
 
@@ -17,6 +20,7 @@
 #define BB8_T_CMD 0x01
 #define BB8_T_CFG 0x02
 #define BB8_T_TELEM 0x81
+#define BB8_T_IMU 0x83
 #define BB8_MAX_MOTORS 4
 #define BB8_MAX_PAYLOAD 255
 #define BB8_FLAG_ENABLE 0x01
@@ -80,6 +84,18 @@ static inline size_t bb8_encode_telem(uint16_t seq, uint32_t us, uint8_t flags, 
   for (int i = 0; i < n; i++) bb8_put_u32(p + 8 + 4 * i, (uint32_t)enc[i]);
   for (int i = 0; i < n; i++) bb8_put_u32(p + 8 + 4 * n + 4 * i, (uint32_t)steps[i]);
   return bb8_frame(BB8_T_TELEM, p, (uint8_t)(8 + 8 * n), out);
+}
+
+// Builds an IMU frame (needs 6 + 31 + 4n bytes); returns the frame length.
+static inline size_t bb8_encode_imu(uint16_t seq, uint32_t us, const float* gyro, const float* accel, uint8_t n,
+                                    const int32_t* enc, uint8_t* out) {
+  uint8_t p[31 + 4 * BB8_MAX_MOTORS];
+  bb8_put_u16(p, seq); bb8_put_u32(p + 2, us);
+  for (int i = 0; i < 3; i++) bb8_put_f32(p + 6 + 4 * i, gyro[i]);
+  for (int i = 0; i < 3; i++) bb8_put_f32(p + 18 + 4 * i, accel[i]);
+  p[30] = n;
+  for (int i = 0; i < n; i++) bb8_put_u32(p + 31 + 4 * i, (uint32_t)enc[i]);
+  return bb8_frame(BB8_T_IMU, p, (uint8_t)(31 + 4 * n), out);
 }
 
 // Incremental parser: feed bytes, returns 1 when a valid frame is in (type, payload, len).

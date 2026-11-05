@@ -29,8 +29,9 @@ Bb8/
 ├── deploy/                        # Jetson Nano + Teensy deployment                  [done]
 │   ├── export_bundle.py           #   freeze PID / LQR / policy + geometry into a bundle
 │   ├── sim_io.py                  #   software-in-the-loop + pty firmware emulator
-│   ├── runtime/                   #   robot side (Python 3.6, numpy): runner, estimator, controllers, IMU, MCU link
-│   └── firmware/bb8_mcu/          #   Teensy 4.0 step generation, encoders, watchdog
+│   ├── runtime/                   #   robot side (Python 3.6, numpy): runner, estimator, controllers, IMU, links
+│   ├── jetson_stepgen/            #   C daemon: real-time STEP/DIR on Jetson Nano GPIO
+│   └── firmware/                  #   bb8_imu (Arduino Nano 33 IoT IMU stream), bb8_mcu (Teensy, optional)
 └── app/
     ├── main_studio.py             # Module 6: FastAPI + WebSockets backend           [done]
     └── static/                    #   index.html, studio.js, studio.css, vendor/three (r160, MIT)
@@ -252,7 +253,10 @@ smoothness weights raised, before putting it on hardware.
 
 ## Deployment to the robot (`deploy/`)
 
-See [`deploy/README.md`](deploy/README.md) for wiring, Jetson setup and the bring-up checklist.
+Hardware: a Jetson Nano runs the controller; an Arduino Nano 33 IoT on the head streams its IMU over
+USB; the stepper drivers hang off Jetson GPIO and are pulsed by a small real-time C daemon
+(`deploy/jetson_stepgen`). See [`deploy/README.md`](deploy/README.md) for wiring, Jetson setup and the
+bring-up checklist.
 
 ```bash
 python -m deploy.export_bundle --out bundle --controller pid                      # PC
@@ -266,7 +270,9 @@ wheel odometry, which the simulator now uses by default too. Tests cover Python 
 protocol interop with the C header; the firmware compiling on the host; the serial link over a pty
 emulator (ramping, watchdog, spin test); software-in-the-loop balancing with pushes, mixed
 motor/encoder signs and step-count odometry; teleop; and the safety faults (wrong motor sign,
-telemetry loss, no arm request).
+telemetry loss, no arm request). The `bb8_stepgen` daemon is tested with its no-GPIO backend and
+against a fake sysfs GPIO tree. The Arduino IMU driver is tested over a pty, with fusion, bias
+removal and timeout. The IMU firmware is compiled on the host against a fake LSM6DS3.
 
 ## Module 2: MJCF generator
 

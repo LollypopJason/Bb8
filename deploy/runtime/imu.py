@@ -11,6 +11,13 @@ gyro bias and level offset come from the robot config (see ``calibrate``).
   a magnetometer heading.
 * ``mpu6050`` - raw registers over ``smbus2`` with an on-Jetson Mahony-style
   complementary filter (gyro 500 dps, accel 4 g, DLPF 44 Hz).
+* ``arduino`` - Arduino Nano 33 IoT (LSM6DS3) / Nano RP2040 Connect (LSM6DSOX)
+  running ``firmware/bb8_imu``: raw 416 Hz gyro + accel over USB serial, fused
+  on the Jetson with the same complementary filter (every sample, with the
+  board's microsecond timestamps). The board can also report wheel encoders.
+
+Drivers that fuse on the Jetson take the gyro bias *before* fusion; the BNO085
+fuses on-chip, so its bias is only removed from the reported rate.
 """
 
 import math
@@ -34,13 +41,22 @@ class ImuSample(object):
         return quat_to_mat(self.quat)
 
 
+class ImuTimeout(RuntimeError):
+    pass
+
+
 class MountedImu(object):
     """Applies the mounting rotation, gyro bias and level offset to a raw IMU."""
 
     def __init__(self, raw, mount_euler_deg=(0, 0, 0), gyro_bias=(0, 0, 0), level_offset_deg=(0, 0)):
         self.raw = raw
         self.R_head_imu = euler_xyz_deg_to_mat(*mount_euler_deg)       # imu vectors -> head frame
-        self.gyro_bias = np.asarray(gyro_bias, dtype=float)              # in IMU frame
+        bias = np.asarray(gyro_bias, dtype=float)                        # in IMU frame
+        if hasattr(raw, "gyro_bias"):                                    # fuses on the Jetson: correct before fusion
+            raw.gyro_bias = bias
+            self.gyro_bias = np.zeros(3)
+        else:
+            self.gyro_bias = bias
         r, p = [math.radians(v) for v in level_offset_deg]
         cr, sr, cp, sp = math.cos(r), math.sin(r), math.cos(p), math.sin(p)
         # rotation of the "true upright" head relative to what the IMU reports
@@ -119,7 +135,7 @@ class ComplementaryFilter(object):
 class Mpu6050(object):
     PWR_MGMT_1, CONFIG, GYRO_CONFIG, ACCEL_CONFIG, ACCEL_XOUT_H = 0x6B, 0x1A, 0x1B, 0x1C, 0x3B
 
-    def __init__(self, i2c_bus=1, address=None):
+    def __init__(self, i2c_bus=1, address=None, fusion_kp=0.5):
         from smbus2 import SMBus
 
         self.addr = address or 0x68
@@ -128,7 +144,8 @@ class Mpu6050(object):
         self.bus.write_byte_data(self.addr, self.CONFIG, 0x03)           # DLPF 44 Hz
         self.bus.write_byte_data(self.addr, self.GYRO_CONFIG, 0x08)      # +-500 dps
         self.bus.write_byte_data(self.addr, self.ACCEL_CONFIG, 0x08)     # +-4 g
-        self.filter = ComplementaryFilter()
+        self.filter = ComplementaryFilter(kp=fusion_kp)
+        self.gyro_bias = np.zeros(3)
         self.last_t = None
 
     def read(self):
@@ -136,7 +153,7 @@ class Mpu6050(object):
         vals = [((raw[i] << 8) | raw[i + 1]) for i in range(0, 14, 2)]
         vals = [v - 65536 if v > 32767 else v for v in vals]
         accel = np.array(vals[0:3]) / 8192.0 * GRAVITY
-        gyro = np.radians(np.array(vals[4:7]) / 65.5)
+        gyro = np.radians(np.array(vals[4:7]) / 65.5) - self.gyro_bias
         t = time.monotonic()
         dt = 0.01 if self.last_t is None else min(max(t - self.last_t, 1e-4), 0.05)
         self.last_t = t
@@ -144,8 +161,84 @@ class Mpu6050(object):
         return q.copy(), gyro, accel, t
 
 
+class ArduinoImu(object):
+    """IMU frames from the Arduino board (``firmware/bb8_imu``) fused on the Jetson."""
+
+    def __init__(self, port, baud=1000000, fusion_kp=0.5, timeout_s=0.05, ser=None):
+        from . import protocol as P
+
+        self.P = P
+        if ser is None:
+            import serial
+
+            ser = serial.Serial(port, baud, timeout=0)
+        self.ser = ser
+        self.parser = P.StreamParser()
+        self.filter = ComplementaryFilter(kp=fusion_kp)
+        self.gyro_bias = np.zeros(3)
+        self.timeout = timeout_s
+        self.last_us = None
+        self.last_rx = None
+        self.gyro = np.zeros(3)
+        self.accel = np.array([0.0, 0.0, GRAVITY])
+        self.encoders = []
+        self.encoder_us = 0
+        self.samples = 0
+        self.dropped = 0
+
+    def _drain(self):
+        waiting = getattr(self.ser, "in_waiting", 0)
+        data = self.ser.read(max(int(waiting), 1))
+        if not data:
+            return
+        for ftype, payload in self.parser.feed(data):
+            if ftype != self.P.T_IMU:
+                continue
+            try:
+                f = self.P.decode(ftype, payload)
+            except ValueError:
+                continue
+            if self.last_us is None:
+                dt = 0.0
+            else:
+                dt = ((f.us - self.last_us) & 0xFFFFFFFF) * 1e-6
+                if dt <= 0 or dt > 0.1:                  # board reset / long gap: restart integration
+                    self.dropped += 1
+                    dt = 0.0
+            self.last_us = f.us
+            self.gyro = np.asarray(f.gyro, dtype=float) - self.gyro_bias
+            self.accel = np.asarray(f.accel, dtype=float)
+            if dt > 0 or not self.filter.initialised:
+                self.filter.update(self.gyro, self.accel, dt)
+            if f.encoders:
+                self.encoders, self.encoder_us = list(f.encoders), f.us
+            self.samples += 1
+            self.last_rx = time.monotonic()
+
+    def read(self):
+        self._drain()
+        if self.last_rx is None or time.monotonic() - self.last_rx > self.timeout:
+            raise ImuTimeout("no samples from the Arduino IMU")
+        return self.filter.q.copy(), self.gyro.copy(), self.accel.copy(), self.last_rx
+
+    def wait_ready(self, timeout=3.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            self._drain()
+            if self.samples > 10:
+                return
+            time.sleep(0.005)
+        raise ImuTimeout("the Arduino IMU is not streaming (check the port and the bb8_imu firmware)")
+
+
 def make_imu(cfg):
     imu_cfg = cfg["imu"]
-    raw = Bno085(imu_cfg["i2c_bus"], imu_cfg["address"]) if imu_cfg["type"] == "bno085" else \
-        Mpu6050(imu_cfg["i2c_bus"], imu_cfg["address"])
+    kind = imu_cfg["type"]
+    if kind == "arduino":
+        raw = ArduinoImu(imu_cfg["port"], imu_cfg["baud"], imu_cfg["fusion_kp"], imu_cfg["timeout_s"])
+        raw.wait_ready()
+    elif kind == "bno085":
+        raw = Bno085(imu_cfg["i2c_bus"], imu_cfg["address"])
+    else:
+        raw = Mpu6050(imu_cfg["i2c_bus"], imu_cfg["address"], imu_cfg["fusion_kp"])
     return MountedImu(raw, imu_cfg["mount_euler_deg"], imu_cfg["gyro_bias"], imu_cfg["level_offset_deg"])

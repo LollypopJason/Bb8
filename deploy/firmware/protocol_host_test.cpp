@@ -43,6 +43,14 @@ int main() {
         }
       }
       printf("FRAMES %d CRCERR %u\n", got, ps.crc_errors);
+    } else if (kind == "IMU") {
+      unsigned seq, n; unsigned long us; float g[3], a[3]; int32_t enc[4];
+      in >> seq >> us >> g[0] >> g[1] >> g[2] >> a[0] >> a[1] >> a[2] >> n;
+      for (unsigned i = 0; i < n; i++) in >> enc[i];
+      uint8_t out[64];
+      size_t len = bb8_encode_imu((uint16_t)seq, (uint32_t)us, g, a, (uint8_t)n, enc, out);
+      for (size_t i = 0; i < len; i++) printf("%02x", out[i]);
+      printf("\n");
     } else if (kind == "TELEM") {
       unsigned seq, flags, n; unsigned long us;
       in >> seq >> us >> flags >> n;

@@ -1,0 +1,14 @@
+# systemd unit: sudo make install && sudo systemctl enable --now bb8-stepgen
+# Edit the GPIO numbers to your wiring (sysfs numbers, see deploy/README.md).
+[Unit]
+Description=BB-8 stepper pulse generator (Jetson GPIO)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/bin/bb8_stepgen --step 216,79,232 --dir 50,194,15 --enable 13 --cpu 3 --rt-prio 80
+Restart=on-failure
+LimitMEMLOCK=infinity
+LimitRTPRIO=99
+
+[Install]
+WantedBy=multi-user.target
