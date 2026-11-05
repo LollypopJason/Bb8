@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BB-8 Studio</title>
+  <link rel="stylesheet" href="/static/studio.css">
+  <script type="importmap">
+    { "imports": { "three": "/static/vendor/three/three.module.min.js" } }
+  </script>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <header>
+      <h1>BB-8 Studio</h1>
+      <div id="statusline"><span id="simtime">t = 0.00 s</span> · <span id="modelabel">–</span> <span id="fallen" class="badge danger hidden">fallen</span></div>
+    </header>
+
+    <details open>
+      <summary>Scene</summary>
+      <label>Example <select id="example"></select></label>
+      <div class="row">
+        <label>Omniwheels <select id="omni"><option value="contact_pair">fast contact-pair</option><option value="subroller">sub-roller</option></select></label>
+        <label>Drive <select id="drive"><option value="velocity">stepper (velocity)</option><option value="motor">torque</option></select></label>
+      </div>
+      <label id="variantwrap">Variant <select id="variant"></select></label>
+      <div class="row buttons">
+        <button id="load">Load scene</button>
+        <button id="reset">Reset</button>
+        <button id="pause">Pause</button>
+      </div>
+      <label>Speed <input id="speed" type="range" min="0.1" max="2" step="0.1" value="1"><output id="speedout">1.0×</output></label>
+      <div class="row toggles">
+        <label><input type="checkbox" id="showlayers"> ball layers</label>
+        <label><input type="checkbox" id="showcollision"> collision geoms</label>
+        <label><input type="checkbox" id="showforces" checked> force arrows</label>
+        <label><input type="checkbox" id="follow" checked> follow</label>
+      </div>
+      <p id="scenedesc" class="muted"></p>
+    </details>
+
+    <details open id="ballpanel">
+      <summary>Composite ball</summary>
+      <div class="grid2">
+        <label>R₀ cavity [mm]<input id="b_r0" type="number" step="1"></label>
+        <label>t foam [mm]<input id="b_tf" type="number" step="0.5"></label>
+        <label>ρ foam [kg/m³]<input id="b_rf" type="number" step="1"></label>
+        <label>t epoxy [mm]<input id="b_te" type="number" step="0.1"></label>
+        <label>ρ epoxy [kg/m³]<input id="b_re" type="number" step="5"></label>
+        <label>μ surface<input id="b_mu" type="number" step="0.05"></label>
+      </div>
+      <table id="balltable" class="mono"></table><div id="ballerr" class="muted"></div>
+      <button id="ballapply">Apply &amp; rebuild</button>
+    </details>
+
+    <details id="headpanel">
+      <summary>Head unit &amp; terrain</summary>
+      <div class="grid2">
+        <label>Wheels<select id="h_n"><option>3</option><option>4</option></select></label>
+        <label>Zenith α [°]<input id="h_alpha" type="number" min="30" max="60" step="1"></label>
+        <label>Chassis mass [kg]<input id="h_mass" type="number" step="0.1"></label>
+        <label>CoM height [m]<input id="h_com" type="number" step="0.01"></label>
+        <label><input type="checkbox" id="h_mag"> magnet [N]</label><input id="h_magf" type="number" step="1">
+        <label><input type="checkbox" id="h_cw"> counterweight [kg]</label><input id="h_cwm" type="number" step="0.1">
+        <label>Floor slope [°]<input id="t_slope" type="number" min="-30" max="30" step="0.5" value="0"></label>
+        <label><input type="checkbox" id="t_bumps"> speed bumps</label>
+      </div>
+      <button id="headapply">Apply &amp; rebuild</button>
+      <details><summary>Advanced: all parameters (JSON)</summary>
+        <textarea id="paramjson" spellcheck="false"></textarea>
+        <button id="paramapply">Apply JSON</button>
+      </details>
+    </details>
+
+    <details open>
+      <summary>Controller</summary>
+      <div id="modes" class="row buttons"></div>
+      <div id="pidbox">
+        <label>Kp <input id="pid_kp" type="range" min="0" max="400" step="5"><output></output></label>
+        <label>Ki <input id="pid_ki" type="range" min="0" max="100" step="1"><output></output></label>
+        <label>Kd <input id="pid_kd" type="range" min="0" max="50" step="0.5"><output></output></label>
+        <label>Outer pos <input id="pid_outer_pos" type="range" min="0" max="1.5" step="0.05"><output></output></label>
+        <label>Outer vel <input id="pid_outer_vel" type="range" min="0" max="1.5" step="0.05"><output></output></label>
+      </div>
+      <div id="lqrbox" class="grid2">
+        <label>Q tilt<input id="q_tilt" type="number" value="400"></label>
+        <label>Q rate<input id="q_rate" type="number" value="10"></label>
+        <label>Q position<input id="q_pos" type="number" value="300"></label>
+        <label>Q velocity<input id="q_vel" type="number" value="60"></label>
+        <button id="lqrdesign">Redesign LQR</button><span id="lqrinfo" class="muted"></span>
+      </div>
+      <div id="rlbox">
+        <label>Policy <select id="policies"></select></label>
+        <div class="row buttons"><button id="policyrefresh">Refresh</button><button id="policyload">Load &amp; run</button></div>
+      </div>
+      <p class="muted">Keys: <b>W/S</b> ±x, <b>A/D</b> ±y, <b>Q/E</b> yaw. Under PID/LQR/RL they steer the target; in manual they drive directly.</p>
+      <label>Teleop speed <input id="teleop" type="range" min="0" max="0.8" step="0.05" value="0.3"><output>0.30 m/s</output></label>
+      <div id="keyviz" class="keys"><span>Q</span><span>W</span><span>E</span><span>A</span><span>S</span><span>D</span></div>
+    </details>
+
+    <details open>
+      <summary>Disturbance</summary>
+      <div class="grid2">
+        <label>Body<select id="pushbody"></select></label>
+        <label>Force [N]<input id="pushf" type="number" value="6" step="1"></label>
+        <label>Duration [ms]<input id="pushd" type="number" value="100" step="10"></label>
+      </div>
+      <div class="row buttons">
+        <button data-push="1,0">+X</button><button data-push="-1,0">−X</button>
+        <button data-push="0,1">+Y</button><button data-push="0,-1">−Y</button>
+        <button data-push="random">random</button>
+      </div>
+    </details>
+
+    <details>
+      <summary>Sensors &amp; latency</summary>
+      <label><input type="checkbox" id="noise" checked> sensor noise / bias / quantisation</label>
+      <label><input type="checkbox" id="curve" checked> stepper pull-out torque curve</label>
+      <label><input type="checkbox" id="latencyon" checked> pipeline delay
+        <input id="latency" type="range" min="0" max="40" step="2" value="10"><output>10 ms</output></label>
+      <button id="hwapply">Apply</button>
+    </details>
+
+    <details>
+      <summary>Assets</summary>
+      <label>Mesh (.stl/.obj)<input type="file" id="meshfile" accept=".stl,.obj,.ply,.off"></label>
+      <div class="grid2">
+        <label>Scale<input id="meshscale" type="number" value="0.001" step="0.001"></label>
+        <label>Mount on<select id="meshparent"></select></label>
+        <label>Density<input id="meshdensity" type="number" value="1240"></label>
+        <label>Height z<input id="meshz" type="number" value="0.3" step="0.05"></label>
+      </div>
+      <button id="meshupload">Upload &amp; rebuild</button>
+      <pre id="meshinfo" class="mono"></pre>
+      <hr>
+      <div class="grid2">
+        <label>Primitive<select id="primtype"><option>box</option><option>sphere</option><option>cylinder</option><option>capsule</option></select></label>
+        <label>Size [m]<input id="primsize" type="number" value="0.08" step="0.01"></label>
+        <label>x<input id="primx" type="number" value="0.8" step="0.1"></label>
+        <label>y<input id="primy" type="number" value="0.0" step="0.1"></label>
+        <label><input type="checkbox" id="primdyn" checked> dynamic</label>
+        <label>Color<input type="color" id="primcolor" value="#3a8ee6"></label>
+      </div>
+      <div class="row buttons"><button id="primadd">Add primitive</button><button id="extrasclear">Clear assets</button></div>
+    </details>
+
+    <details>
+      <summary>RL training</summary>
+      <div class="grid2">
+        <label>Algorithm<select id="algo"><option>PPO</option><option>SAC</option></select></label>
+        <label>Task<select id="task"><option value="station_keeping">station keeping</option><option value="velocity_tracking">velocity tracking</option></select></label>
+        <label>Timesteps<input id="steps" type="number" value="1000000" step="100000"></label>
+        <label>Envs<input id="nenvs" type="number" value="4" min="1" max="64"></label>
+      </div>
+      <div class="row buttons"><button id="trainstart">Start</button><button id="trainstop">Stop</button><button id="trainload">Load latest</button></div>
+      <progress id="trainprog" max="1" value="0"></progress>
+      <div id="trainstate" class="muted"></div>
+    </details>
+
+    <details>
+      <summary>Logging</summary>
+      <label><input type="checkbox" id="record"> record (otherwise the last 60 s are kept)</label>
+      <div class="row buttons"><a class="button" href="/api/log.csv">CSV</a><a class="button" href="/api/log.json">JSON</a></div>
+    </details>
+  </aside>
+
+  <main id="viewport">
+    <canvas id="three"></canvas>
+    <div id="toast" class="hidden"></div>
+  </main>
+
+  <section id="charts">
+    <div class="chart"><h3>Head tilt [°]</h3><canvas id="c_tilt"></canvas></div>
+    <div class="chart"><h3 id="t_vel">Velocity [m/s]</h3><canvas id="c_vel"></canvas></div>
+    <div class="chart"><h3 id="t_trq">Wheel torque [N·m]</h3><canvas id="c_trq"></canvas></div>
+    <div class="chart"><h3>Reward terms</h3><canvas id="c_rew"></canvas></div>
+    <div class="chart"><h3>Training: episode return</h3><canvas id="c_train"></canvas></div>
+  </section>
+</div>
+<script type="module" src="/static/studio.js"></script>
+</body>
+</html>

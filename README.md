@@ -26,7 +26,9 @@ Bb8/
 ├── controllers/classical.py       # Module 3: omni mixers, cascaded PID, FD-LQR      [done]
 ├── envs/ball_balancer_env.py      # Module 4: Gymnasium env + domain randomisation   [done]
 ├── training/train_rl.py           # Module 5: SB3 PPO/SAC manager                    [done]
-└── app/main_studio.py             # Module 6: FastAPI + WebSockets + Three.js studio [next]
+└── app/
+    ├── main_studio.py             # Module 6: FastAPI + WebSockets backend           [done]
+    └── static/                    #   index.html, studio.js, studio.css, vendor/three (r160, MIT)
 ```
 
 ## Install & run
@@ -161,7 +163,7 @@ env.step_ctrl(ctrl)           # raw actuator ctrl, e.g. from CascadedPID / BallB
   yaw-rate error, position error and the previous action.
 * **Action:** with `body` (default) the policy commands the relative ball rotation about x, y and z,
   mixed through J. With `wheel` it commands each wheel directly.
-* **Tasks:** `station_keeping` with random pushes (default 0.25 per second, 3–10 N), and
+* **Tasks:** `station_keeping` with random pushes (default 0.25 per second, 2–6 N for 50–120 ms), and
   `velocity_tracking` with resampled `(vx*, vy*, ωz*)` commands, ramped at an acceleration limit.
 * **Reward** (`RewardWeights`): alive, tilt², velocity tracking `exp(−|v−v*|²/σ)`, position, yaw rate,
   angular-rate², ‖u‖², ‖u − u_prev‖², and a fall penalty.
@@ -195,6 +197,53 @@ policy = PolicyRunner.load(mgr.latest_onnx or mgr.latest_policy)   # obs -> acti
   `predict` to within 1e-5.
 * `evaluate()` scores either a policy or a classical controller on the same env.
 * Measured here: about 900 env steps/s on 4 CPU cores, PPO updates included.
+
+## Module 6: web studio (`app/main_studio.py` + `app/static`)
+
+```bash
+python -m app.main_studio                       # open http://localhost:8000
+python -m app.main_studio --host 0.0.0.0 --port 8000 --runs runs   # reachable from other laptops on the LAN
+```
+
+MuJoCo runs on the server: 500 Hz physics and 100 Hz control in real time, with a 0.1–2× speed
+control. The browser builds the Three.js scene from a descriptor of the compiled model, covering every
+geom, the mesh vertex buffers and heightfields, so uploaded meshes, primitives, rollers and terrain all
+appear automatically. Over `/ws` the browser receives body poses, contact-force and push arrows and the
+telemetry at 30 Hz. Three.js 0.160 is bundled locally, so no CDN or internet is needed.
+
+* **Scene:** all 5 examples, plus the omniwheel model (fast or sub-roller), the drive (stepper
+  velocity or torque) and the variant. Toggles for showing the ball layers, collision geoms and force
+  arrows, and for camera follow.
+* **Composite ball:** edit R₀, layer thicknesses and densities, and surface μ to see a live per-layer
+  mass and inertia table, then **Apply** to rebuild. The head unit (wheel count, α, mass, CoM, magnet,
+  counterweight) and the terrain (slope, bumps) can be edited too, and an advanced JSON editor covers
+  every parameter.
+* **Controller:** Manual, Cascaded PID (live gain sliders), LQR (Q weights plus redesign, showing
+  closed-loop ρ) or RL policy (pick any `.onnx`/`.zip` under `--runs` and hot-load it). WASD/QE drive
+  the robot directly in manual mode and steer the balance target in PID, LQR and RL modes.
+* **Disturbance:** ±X, ±Y or random pushes in newtons, with a set duration, on any body.
+* **Sensors & latency:** noise, the pull-out curve, and a 0–40 ms delay.
+* **Assets:** upload STL/OBJ meshes (trimesh mass properties, convex hulls), free or mounted on the
+  head; add primitive props.
+* **RL training:** start or stop PPO/SAC on the current scene and hardware; watch the progress bar and
+  episode-return chart live; load the latest checkpoint into the 3D view.
+* **Charts and logging:** head tilt, velocity versus target, wheel torques, and the reward breakdown.
+  Record and download CSV or JSON logs.
+
+REST endpoints (all JSON): `/api/scene`, `/api/status`, `/api/params`, `/api/ball/preview`,
+`/api/ball/apply`, `/api/hardware`, `/api/controller`, `/api/teleop`, `/api/push`, `/api/sim`
+(pause/speed/reset/record), `/api/step`, `/api/mesh` (multipart), `/api/primitive`,
+`/api/extras/clear`, `/api/train/start|stop|status`, `/api/policies`, `/api/policy/load`,
+`/api/log.csv`, `/api/log.json`.
+
+**Results from the reference run:** 1M steps of PPO on BB-8 station keeping, with noise, 10 ms delay,
+domain randomisation and the earlier, harsher pushes of 3–10 N. Episode length rose from about 90 to
+about 1,500–1,860 of 2,000 steps. Over 10 randomised episodes the 500k checkpoint fell in 70% of them
+and the 200k checkpoint in all of them. On the same harsh pushes, PID fell in 40% and LQR in 60%. With
+the current default pushes (2–6 N), PID and LQR both had 0% falls. The PPO policy balances in the
+studio, but it switches the wheel torques hard between their limits and drifts from its target. Treat
+it as a working pipeline rather than a finished controller: train longer, or with action and
+smoothness weights raised, before putting it on hardware.
 
 ## Module 2: MJCF generator
 

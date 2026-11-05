@@ -96,8 +96,8 @@ class DomainRandomization:
 class PushConfig:
     enabled: bool = True
     rate: float = 0.25                  # expected pushes per second
-    force: Tuple[float, float] = (3.0, 10.0)            # [N]
-    duration: Tuple[float, float] = (0.05, 0.15)        # [s]
+    force: Tuple[float, float] = (2.0, 6.0)             # [N]  (raise for a harder curriculum)
+    duration: Tuple[float, float] = (0.05, 0.12)        # [s]
     body: str = "head"
 
 

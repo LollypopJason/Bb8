@@ -1,0 +1,83 @@
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --text: #1d2228;
+  --muted: #69727d;
+  --border: #d9dde3;
+  --accent: #e8701c;
+  --accent-text: #ffffff;
+  --danger: #c62828;
+  --chart-bg: #ffffff;
+  --grid: #e7eaee;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --panel: #1c2026;
+    --text: #e6e9ed;
+    --muted: #9aa4af;
+    --border: #2e343c;
+    --accent: #f28a3c;
+    --accent-text: #14171b;
+    --danger: #ef5350;
+    --chart-bg: #1c2026;
+    --grid: #2a3037;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+#app { display: grid; grid-template-columns: 330px 1fr; grid-template-rows: 1fr 210px; height: 100vh; }
+#panel { grid-row: 1 / span 2; overflow-y: auto; background: var(--panel); border-right: 1px solid var(--border);
+  padding: 10px 12px 40px; }
+#panel header h1 { font-size: 18px; margin: 0 0 2px; }
+#statusline { color: var(--muted); margin-bottom: 8px; }
+details { border-top: 1px solid var(--border); padding: 6px 0; }
+summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+label { display: block; margin: 5px 0; }
+label select, label input[type=number], label input[type=file] { width: 100%; margin-top: 2px; }
+input[type=range] { width: calc(100% - 70px); vertical-align: middle; }
+output { display: inline-block; width: 64px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+select, input[type=number], textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 3px 5px; font: inherit; }
+textarea { width: 100%; height: 220px; font: 11px/1.3 ui-monospace, Menlo, Consolas, monospace; }
+.row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.row label { flex: 1 1 45%; }
+.toggles label { flex: 1 1 45%; margin: 2px 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; align-items: end; }
+button, a.button { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 10px; cursor: pointer; font: inherit; text-decoration: none; display: inline-block; margin: 3px 0; }
+button:hover, a.button:hover { border-color: var(--accent); }
+button.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.buttons button { flex: 0 0 auto; }
+.muted { color: var(--muted); }
+.mono { font: 11px/1.35 ui-monospace, Menlo, Consolas, monospace; white-space: pre; overflow-x: auto;
+  background: var(--bg); padding: 6px; border-radius: 4px; margin: 6px 0; }
+.badge { padding: 1px 6px; border-radius: 8px; font-size: 11px; }
+.badge.danger { background: var(--danger); color: #fff; }
+.hidden { display: none !important; }
+progress { width: 100%; }
+.keys { display: grid; grid-template-columns: repeat(3, 28px); gap: 3px; margin: 4px 0; }
+.keys span { border: 1px solid var(--border); border-radius: 4px; text-align: center; padding: 3px 0; color: var(--muted); }
+.keys span.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+#viewport { position: relative; overflow: hidden; }
+#three { width: 100%; height: 100%; display: block; }
+#toast { position: absolute; left: 12px; bottom: 12px; max-width: 70%; background: var(--danger); color: #fff;
+  padding: 6px 10px; border-radius: 6px; }
+#charts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; padding: 6px;
+  border-top: 1px solid var(--border); }
+.chart { background: var(--chart-bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px;
+  display: flex; flex-direction: column; min-width: 0; }
+.chart h3 { margin: 0; font-size: 12px; font-weight: 600; }
+.chart canvas { flex: 1; width: 100%; min-height: 0; }
+@media (max-width: 900px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: 55vh auto auto; height: auto; }
+  #panel { grid-row: 3; border-right: 0; }
+  #viewport { grid-row: 1; }
+  #charts { grid-row: 2; grid-template-columns: 1fr 1fr; }
+  .chart { height: 160px; }
+}
+#balltable { width: 100%; border-collapse: collapse; white-space: normal; }
+#balltable td, #balltable th { padding: 1px 4px; text-align: right; }
+#balltable td:first-child, #balltable th:first-child { text-align: left; }
+#balltable tr.total td { border-top: 1px solid var(--border); font-weight: 600; }

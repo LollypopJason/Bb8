@@ -1448,7 +1448,7 @@ EXAMPLES: Dict[str, ExampleInfo] = {
                                     build_single_omniwheel, SingleOmniwheelParams),
     "kiwi_drive": ExampleInfo("kiwi_drive", 3, "3-wheel kiwi holonomic omni-drive",
                               build_kiwi_drive, KiwiDriveParams),
-    "planar_balancer": ExampleInfo("planar_balancer", 4, "1D/2D single-wheel ball balancer",
+    "planar_balancer": ExampleInfo("planar_balancer", 4, "1D/2D planar ball balancer",
                                    build_planar_balancer, PlanarBalancerParams),
     "bb8": ExampleInfo("bb8", 5, "Full BB-8 composite ball-balancer (hero scene)", build_bb8, BB8Params),
 }
