@@ -189,7 +189,14 @@ class SceneStepper:
             s = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, ac.site)
             if min(g, tg, s) < 0:
                 raise KeyError(f"aligned contact refers to unknown names: {ac}")
-            fr = np.asarray(ac.friction, dtype=float)
+            # Friction is read live from model.pair_friction (so domain randomisation of the
+            # model reaches the aligned contacts); the metadata value is the fallback.
+            pid = -1
+            for k in range(model.npair):
+                if {int(model.pair_geom1[k]), int(model.pair_geom2[k])} == {g, tg}:
+                    pid = k
+                    break
+            fr = model.pair_friction[pid] if pid >= 0 else np.asarray(ac.friction, dtype=float)
             self._aligned_pairs[(g, tg)] = (s, fr)
             self._aligned_pairs[(tg, g)] = (s, fr)
         self._magnets: List[Tuple[int, int, int, int, MagnetLink]] = []

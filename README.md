@@ -18,12 +18,13 @@ Bb8/
 │   └── composite_ball_params.py   # Module 1: dataclasses + physics calculators   [done]
 ├── models/
 │   ├── mjcf_generator.py          # Module 2: MJCF builder, 5 examples, mesh import [done]
-│   └── runtime.py                 #   step-time helpers (contact alignment, magnet, pushes)
+│   ├── runtime.py                 #   step-time helpers (contact alignment, magnet, pushes, delay line)
+│   └── io_bus.py                  #   sensor/actuator bus (noise, bias drift, quantisation, latency)
 ├── tests/
 │   ├── test_composite_ball.py
 │   └── test_mjcf_generator.py
 ├── controllers/classical.py       # Module 3: omni mixers, cascaded PID, FD-LQR      [done]
-├── envs/ball_balancer_env.py      # Module 4: Gymnasium env + domain randomisation   [next]
+├── envs/ball_balancer_env.py      # Module 4: Gymnasium env + domain randomisation   [done]
 ├── training/train_rl.py           # Module 5: SB3 PPO/SAC manager                    [next]
 └── app/main_studio.py             # Module 6: FastAPI + WebSockets + Three.js studio [next]
 ```
@@ -130,6 +131,45 @@ tracking; and cart-pole and spherical pendulum stabilisation.
 **Example 4 change:** the `1d` variant is now a pitch-plane slice with two driven wheels at ±α. With a
 single wheel on top, the head can pivot on that wheel's contact, which is a different, doubly unstable
 system, so gains tuned on it wouldn't transfer to BB-8.
+
+## Module 4: I/O bus and Gymnasium environment
+
+**`models/io_bus.py`**
+* `SensorBus` reads the scene's IMU (framequat, gyro, accelerometer), the 1200 CPR encoders and the
+  ball channels. It adds gyro white noise, a per-episode bias plus a random walk, orientation and
+  accelerometer noise, and quantises the encoders (wheel speed is then the count difference over the
+  control period). `SensorBus.estimate()` turns a reading into the reduced balance state the
+  controllers use.
+* `ActuatorBus` applies the pipeline delay through a physics-step ring buffer, then saturation, then
+  the NEMA 17 pull-out curve (each wheel's force range is updated from its speed).
+
+**`envs/ball_balancer_env.py`**, registered as `BB8BallBalancer-v0`:
+
+```python
+from envs.ball_balancer_env import BallBalancerEnv, EnvConfig
+env = BallBalancerEnv(EnvConfig(scene="bb8", task="velocity_tracking"))   # or planar_1d / planar_2d
+obs, info = env.reset(seed=0)
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+info["reward_terms"]          # per-term reward breakdown
+env.step_ctrl(ctrl)           # raw actuator ctrl, e.g. from CascadedPID / BallBotLQR
+```
+
+* Physics runs at 500 Hz through `SceneStepper` + `ActuatorBus`; the policy runs at 100 Hz.
+  Observations come from `SensorBus`. Noise and latency switch on and off with
+  `hardware.noise_enabled` / `latency_enabled`.
+* **Observation:** roll, pitch, gyro (yaw frame), wheel speeds, ball velocity, velocity error,
+  yaw-rate error, position error and the previous action.
+* **Action:** with `body` (default) the policy commands the relative ball rotation about x, y and z,
+  mixed through J. With `wheel` it commands each wheel directly.
+* **Tasks:** `station_keeping` with random pushes (default 0.25 per second, 3–10 N), and
+  `velocity_tracking` with resampled `(vx*, vy*, ωz*)` commands, ramped at an acceleration limit.
+* **Reward** (`RewardWeights`): alive, tilt², velocity tracking `exp(−|v−v*|²/σ)`, position, yaw rate,
+  angular-rate², ‖u‖², ‖u − u_prev‖², and a fall penalty.
+* **Domain randomisation** is applied to the compiled model at every reset: epoxy shell mass ±15%,
+  ball, floor and omniwheel friction, head CoM offset (±1 cm xy, ±1.5 cm z), head mass ±10%, and
+  optionally the latency.
+* Through `step_ctrl`, the cascaded PID and the LQR both balance BB-8 and the 1D slice for 12 s, with
+  noise, 10 ms delay, domain randomisation and random pushes.
 
 ## Module 2: MJCF generator
 
