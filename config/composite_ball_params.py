@@ -623,6 +623,12 @@ class HardwareProfile:
     noise_enabled: bool = True
     latency_enabled: bool = True
     torque_speed_curve: bool = True
+    # "odometry": ball velocity / position from IMU + wheel encoders, exactly like the robot
+    # (deploy.runtime.estimator); "sensor": noisy ground-truth ball channels.
+    ball_state_source: str = "odometry"
+    # low-pass time constant on the odometry ball velocity [s]: 1200 CPR at 100 Hz quantises
+    # wheel speed to ~0.5 rad/s, which the LQR velocity gains would otherwise amplify
+    odometry_velocity_tau: float = 0.04
 
     @property
     def delay_steps(self) -> int:
@@ -634,6 +640,10 @@ class HardwareProfile:
     def validate(self) -> None:
         for part in (self.motor, self.encoder, self.imu, self.ball_sensors, self.latency, self.loop):
             part.validate()
+        if self.ball_state_source not in ("odometry", "sensor"):
+            raise ValueError("ball_state_source must be 'odometry' or 'sensor'")
+        if not (0.0 <= self.odometry_velocity_tau <= 0.5):
+            raise ValueError("odometry_velocity_tau must be within [0, 0.5] s")
 
 
 @dataclass

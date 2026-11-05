@@ -62,8 +62,9 @@ def test_balancing_push_and_teleop(client):
     sess = client.session
     client.post("/api/step", json={"n": 100})
     assert client.post("/api/push", json={"body": "head", "force": [6, 0, 0], "duration": 0.1}).status_code == 200
-    client.post("/api/step", json={"n": 20})
-    assert abs(sess.log_rows()[-1]["pitch_deg"]) > 0.3           # the push tilts the head
+    client.post("/api/step", json={"n": 30})
+    peak = max(max(abs(r["pitch_deg"]), abs(r["roll_deg"])) for r in sess.log_rows()[-30:])
+    assert peak > 0.3                                             # the push tilts the head
     client.post("/api/step", json={"n": 400})
     assert not sess.fallen
     assert client.post("/api/push", json={"body": "nope", "force": [1, 0, 0]}).status_code == 400

@@ -26,6 +26,11 @@ Bb8/
 ├── controllers/classical.py       # Module 3: omni mixers, cascaded PID, FD-LQR      [done]
 ├── envs/ball_balancer_env.py      # Module 4: Gymnasium env + domain randomisation   [done]
 ├── training/train_rl.py           # Module 5: SB3 PPO/SAC manager                    [done]
+├── deploy/                        # Jetson Nano + Teensy deployment                  [done]
+│   ├── export_bundle.py           #   freeze PID / LQR / policy + geometry into a bundle
+│   ├── sim_io.py                  #   software-in-the-loop + pty firmware emulator
+│   ├── runtime/                   #   robot side (Python 3.6, numpy): runner, estimator, controllers, IMU, MCU link
+│   └── firmware/bb8_mcu/          #   Teensy 4.0 step generation, encoders, watchdog
 └── app/
     ├── main_studio.py             # Module 6: FastAPI + WebSockets backend           [done]
     └── static/                    #   index.html, studio.js, studio.css, vendor/three (r160, MIT)
@@ -244,6 +249,24 @@ the current default pushes (2–6 N), PID and LQR both had 0% falls. The PPO pol
 studio, but it switches the wheel torques hard between their limits and drifts from its target. Treat
 it as a working pipeline rather than a finished controller: train longer, or with action and
 smoothness weights raised, before putting it on hardware.
+
+## Deployment to the robot (`deploy/`)
+
+See [`deploy/README.md`](deploy/README.md) for wiring, Jetson setup and the bring-up checklist.
+
+```bash
+python -m deploy.export_bundle --out bundle --controller pid                      # PC
+python -m deploy.sim_io --bundle bundle --controller pid --push 6 --seconds 20    # PC: robot code vs MuJoCo
+python3 -m deploy.runtime.runner run --bundle bundle --config robot.json          # Jetson Nano
+```
+
+The robot runtime reproduces the simulator's PID, LQR, observation and action mapping exactly; the
+tests compare them to within 1e-12 (1e-5 for the network). It estimates the ball state from IMU and
+wheel odometry, which the simulator now uses by default too. Tests cover Python 3.6 compatibility;
+protocol interop with the C header; the firmware compiling on the host; the serial link over a pty
+emulator (ramping, watchdog, spin test); software-in-the-loop balancing with pushes, mixed
+motor/encoder signs and step-count odometry; teleop; and the safety faults (wrong motor sign,
+telemetry loss, no arm request).
 
 ## Module 2: MJCF generator
 

@@ -19,5 +19,9 @@ uvicorn[standard]>=0.27
 websockets>=12.0
 pillow>=10.0
 
+# --- Deployment (development side: bundle export, SIL, pty MCU emulator) ---
+pyserial>=3.5
+vermin>=1.6            # checks the robot runtime stays Python 3.6 compatible
+
 # --- Dev / tests ---
 pytest>=7.4

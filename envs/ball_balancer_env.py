@@ -9,7 +9,9 @@
   saturation, stepper pull-out curve);
 * observations from :class:`models.io_bus.SensorBus` (IMU noise / bias drift,
   1200 CPR encoders, ball sensor noise) - toggle with ``hardware.noise_enabled``
-  and ``hardware.latency_enabled``;
+  and ``hardware.latency_enabled``. With ``hardware.ball_state_source="odometry"``
+  (default) ball velocity / position come from wheel odometry through the exact
+  estimator the robot runs (``deploy.runtime.estimator``);
 * tasks ``station_keeping`` (hold the origin under random pushes) and
   ``velocity_tracking`` (follow resampled ``(vx*, vy*, wz*)`` commands);
 * reward terms with tunable weights (:class:`RewardWeights`), returned per
@@ -57,6 +59,8 @@ from controllers.classical import BalanceState, BalanceTarget, BallBotModel, Bal
 from models.io_bus import ActuatorBus, SensorBus
 from models.mjcf_generator import SceneBundle, build_bb8, build_planar_balancer
 from models.runtime import SceneStepper
+from deploy.runtime.estimator import OdometryEstimator
+from deploy.runtime.mathutil import quat_to_mat
 
 __all__ = ["RewardWeights", "DomainRandomization", "PushConfig", "EnvConfig", "BallBalancerEnv", "ENV_ID"]
 
@@ -160,6 +164,9 @@ class BallBalancerEnv(gym.Env):
         self.control_dt = self.frame_skip * self.model.opt.timestep
         self.sensors = SensorBus(self.model, self.meta, hw)
         self.actuators = ActuatorBus(self.model, self.meta, hw, motor=self._motor_params())
+        # Robot-identical odometry (deploy.runtime.estimator) or noisy ground-truth ball sensors
+        self.odometry = (OdometryEstimator(self.mixer.J, self.bbm.R, self.bbm.active, hw.odometry_velocity_tau)
+                         if hw.ball_state_source == "odometry" else None)
         self.n_wheels = len(self.meta.wheels)
         self.n_act = 3 if self.cfg.action_mode == "body" else self.model.nu
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self.n_act,), dtype=np.float32)
@@ -283,8 +290,10 @@ class BallBalancerEnv(gym.Env):
         self.step_count = 0
         self.physics_step = 0
         self._update_command()
+        if self.odometry is not None:
+            self.odometry.reset(position=self.data.xpos[self.bbm.ball_id][:2].copy())
         reading = self.sensors.read(self.data)
-        obs = self._observation(reading)
+        obs = self._observation(reading, dt=0.0)
         return obs, {"randomization": dr_info}
 
     def _update_command(self) -> None:
@@ -335,8 +344,15 @@ class BallBalancerEnv(gym.Env):
         ctrl[lim] = np.clip(ctrl[lim], lo[lim], hi[lim])
         return ctrl
 
-    def _observation(self, reading) -> np.ndarray:
-        state = SensorBus.estimate(reading, self.target.position, self.bbm.active)
+    def _estimate(self, reading, dt: float) -> BalanceState:
+        if self.odometry is not None:
+            s = self.odometry.update(quat_to_mat(reading.imu_quat), reading.gyro, reading.wheel_vel, dt,
+                                     self.target.position)
+            return BalanceState.from_vector(s.vector(), yaw=s.yaw)
+        return SensorBus.estimate(reading, self.target.position, self.bbm.active)
+
+    def _observation(self, reading, dt: Optional[float] = None) -> np.ndarray:
+        state = self._estimate(reading, self.control_dt if dt is None else dt)
         self.last_reading, self.last_state = reading, state
         err = state.error(self.target)
         max_w = max(self._motor_params().max_wheel_speed, 1e-6)
@@ -402,9 +418,9 @@ class BallBalancerEnv(gym.Env):
             reward -= self.cfg.rewards.fall
             terms["fall"] = -self.cfg.rewards.fall
         truncated = self.step_count >= self._max_steps
+        self.prev_action = action          # the observation carries the action just applied
         reading = self.sensors.read(self.data) if finite else self.last_reading
         obs = self._observation(reading) if finite else np.zeros(self.observation_space.shape, np.float32)
-        self.prev_action = action
         info = {
             "reward_terms": terms,
             "tilt_deg": tilt,

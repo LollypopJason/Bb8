@@ -171,6 +171,12 @@ def test_gym_make():
 def test_classical_controllers_through_noisy_env(scene, kind):
     cfg = EnvConfig(scene=scene, episode_seconds=12.0)
     cfg.pushes.rate = 0.3
+    if scene == "bb8":
+        # Ball velocity comes from wheel odometry (as on the robot). Without preload each wheel has
+        # ~7 N normal load, below the 15 N the stepper can push at the rim, so an aggressive LQR
+        # slips the wheels and corrupts odometry. The magnetic preload of the design fixes that.
+        cfg.bb8.head.magnet.enabled = True
+        cfg.bb8.head.magnet.force = 20.0
     env = BallBalancerEnv(cfg)
     env.reset(seed=5)
     if kind == "pid":

@@ -245,8 +245,12 @@ def make_vec_env(env_cfg: EnvConfig, n_envs: int, seed: int = 0, kind: str = "su
 # --------------------------------------------------------------------------- #
 # ONNX export & policy playback
 # --------------------------------------------------------------------------- #
-def export_onnx(model: Any, path: str, obs_rms: Any = None, clip_obs: float = 10.0, epsilon: float = 1e-8) -> str:
-    """Export the deterministic actor of a PPO / SAC model to ONNX (``obs -> action in [-1, 1]``)."""
+def export_onnx(model: Any, path: str, obs_rms: Any = None, clip_obs: float = 10.0, epsilon: float = 1e-8,
+                opset: int = 17) -> str:
+    """Export the deterministic actor of a PPO / SAC model to ONNX (``obs -> action in [-1, 1]``).
+
+    Use ``opset=13`` for older onnxruntime builds (e.g. Jetson Nano / JetPack 4.x).
+    """
     import torch
 
     policy = model.policy
@@ -278,7 +282,7 @@ def export_onnx(model: Any, path: str, obs_rms: Any = None, clip_obs: float = 10
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(actor, dummy, path, input_names=["obs"], output_names=["action"],
-                          dynamic_axes={"obs": {0: "batch"}, "action": {0: "batch"}}, opset_version=17,
+                          dynamic_axes={"obs": {0: "batch"}, "action": {0: "batch"}}, opset_version=opset,
                           dynamo=False)
     return path
 
