@@ -40,6 +40,7 @@ __all__ = [
     "SceneStepper",
     "PushDisturbance",
     "contact_forces_between",
+    "DelayLine",
 ]
 
 
@@ -392,3 +393,33 @@ class SceneStepper:
         """Clear pending pushes (call after ``mj_resetData``)."""
         self.pushes.clear()
         self.data.xfrc_applied[:] = 0.0
+
+
+class DelayLine:
+    """Ring-buffer pipeline delay at physics-step resolution.
+
+    A command submitted at physics step ``k`` becomes active at step
+    ``k + delay_steps`` and stays active until a newer one activates.
+    """
+
+    def __init__(self, size: int, delay_steps: int, initial: Optional[Sequence[float]] = None) -> None:
+        if delay_steps < 0:
+            raise ValueError("delay_steps must be >= 0")
+        self.size = int(size)
+        self.delay_steps = int(delay_steps)
+        self._initial = np.zeros(self.size) if initial is None else np.asarray(initial, dtype=float).copy()
+        self.reset()
+
+    def reset(self, initial: Optional[Sequence[float]] = None) -> None:
+        if initial is not None:
+            self._initial = np.asarray(initial, dtype=float).copy()
+        self._queue: List[Tuple[int, np.ndarray]] = []
+        self._active = self._initial.copy()
+
+    def submit(self, value: Sequence[float], now_step: int) -> None:
+        self._queue.append((int(now_step) + self.delay_steps, np.asarray(value, dtype=float).copy()))
+
+    def current(self, now_step: int) -> np.ndarray:
+        while self._queue and self._queue[0][0] <= now_step:
+            self._active = self._queue.pop(0)[1]
+        return self._active

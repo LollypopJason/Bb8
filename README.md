@@ -22,7 +22,7 @@ Bb8/
 ├── tests/
 │   ├── test_composite_ball.py
 │   └── test_mjcf_generator.py
-├── controllers/classical.py       # Module 3: omni mixer, cascaded PID, FD-LQR       [next]
+├── controllers/classical.py       # Module 3: omni mixers, cascaded PID, FD-LQR      [done]
 ├── envs/ball_balancer_env.py      # Module 4: Gymnasium env + domain randomisation   [next]
 ├── training/train_rl.py           # Module 5: SB3 PPO/SAC manager                    [next]
 └── app/main_studio.py             # Module 6: FastAPI + WebSockets + Three.js studio [next]
@@ -32,7 +32,7 @@ Bb8/
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                                   # 28 physics/integration tests
+python -m pytest -q                                   # physics / controller / env / studio tests
 python -m config.composite_ball_params                # ball calculator report
 python -m models.mjcf_generator --list
 python -m models.mjcf_generator --example bb8 --omni-mode subroller --magnet 20 --check 2 --out build/bb8
@@ -74,6 +74,63 @@ surface `friction`, `solref`, `solimp` and `condim`. Other contents of the modul
 * Parameter sets for every example, plus `SimulationParams` / `TerrainParams` (slope, bumps, heightfields).
 * `scaled()` for domain randomisation, and JSON round-trip through `params_to_dict` / `params_from_dict`.
 
+## Hardware profile (sim-to-real defaults)
+
+`HardwareProfile` in `config/composite_ball_params.py` holds the motor, encoder, IMU and ball-sensor
+noise, the pipeline latency and the loop rates. Every value can be changed in config and in the UI.
+
+| item | default |
+|------|---------|
+| wheel drive | NEMA 17 17HS19-2004S1 @ 24 V, **direct drive**, 0.44 N·m pull-out torque, 18.85 rad/s (180 RPM), velocity (step-rate) servo `kv = 0.6`, pull-out torque falls as 1/ω above 300 RPM |
+| wheel joint armature | 0.0008 kg·m² (the prototype spec; see note) |
+| encoder | 1200 CPR on the output shaft, quantised |
+| IMU | gyro white noise 0.005 rad/s, bias offset 0.01 rad/s plus a random walk, orientation noise 0.003 rad, accelerometer noise 0.03 m/s² |
+| loop | physics 500 Hz (dt = 2 ms), control 100 Hz (`frame_skip = 5`), 10 ms pipeline delay (adjustable 0–40 ms) |
+
+*Why direct drive:* with a 30:1 gearbox, 44 N·cm at the wheel would mean only 1.5 N·cm at the motor,
+and 180 RPM at the wheel would mean 5,400 RPM at the motor. A NEMA 17 can't do either. Driving the
+wheel directly gives both the 0.44 N·m and the 180 RPM wheel targets at 24 V.
+*Why the 0.0008 kg·m² armature:* the bare rotor is 8.2e-6 kg·m². That inertia, plus a light
+omniwheel, under a stiff step-rate servo at dt = 2 ms injects energy into the wheel–ball coupling,
+because MuJoCo solves contacts with the explicit mass matrix while the servo gain is integrated
+implicitly. 0.0008 kg·m² is about 10% of the ball load reflected to each wheel, removes that
+artefact, and leaves the balance dynamics practically unchanged.
+
+## Module 3: classical controllers (`controllers/classical.py`)
+
+* **Mixers:** `KiwiMixer` implements the 120° matrix `ω = 1/r [−sinθ cosθ R] [vx vy ωz]ᵀ`.
+  `BallWheelMixer` implements `ω_w = J (Ω_ball − Ω_head)` and `τ_w = J⁻ᵀ T`. `WheelCommandMapper`
+  converts these to actuator `ctrl` values for velocity, torque or position actuators.
+* **Reduced balance state** (`BallBotModel`), in the head's yaw frame:
+  `[roll, pitch, roll_rate, pitch_rate, ex, ey, vx, vy, yaw_rate]`. Ball surface rotation and wheel
+  angles are left out. `lift()` builds a full MuJoCo state that obeys the contact constraints: the ball
+  rolls without slipping, the head rotates about the ball centre, and wheel speeds match through J.
+* **Linearisation through `SceneStepper`:** `linearize_reduced` takes central finite differences of
+  the 100 Hz map in reduced coordinates, saving and restoring state with
+  `mj_getState`/`mj_setState(mjSTATE_INTEGRATION)`, so the aligned omniwheel friction and the magnet
+  are part of (A, B). The delay's physics-step remainder enters as a separate `B_old`. `linearize_full`
+  works on the full tangent state and matches `mujoco.mjd_transitionFD` to machine precision on plain
+  scenes.
+* **LQR:** `BallBotLQR.design(bundle, hardware)` solves the DARE on a model augmented for the delay
+  (exact for any delay at physics-step resolution). It adds a rolling feedforward for velocity tracking
+  and has separate default weights for velocity mode and torque mode. `FullStateLQR` handles the
+  pendulums.
+* **Cascaded PID:** the outer loop turns position and velocity error into a lean setpoint (≤ 0.12 rad).
+  The inner loop runs PID on roll and pitch, with the derivative taken on the gyro. For the stepper
+  servo the inner loop's output is integrated into a rate command, with anti-windup against saturation.
+  Torque mode has its own default gains. `CartPolePID` handles Example 1.
+* `BalanceTarget` covers station keeping, and velocity and yaw-rate tracking through a moving
+  setpoint with acceleration-limited command ramps.
+* `ClosedLoop` runs any controller with frame skip and the `DelayLine` pipeline delay.
+
+Tested, all with the default 10 ms delay: LQR and PID station keeping through a 6–8 N push on BB-8
+(both omniwheel modes, velocity and torque drives) and on the 1D and 2D balancers; velocity and yaw-rate
+tracking; and cart-pole and spherical pendulum stabilisation.
+
+**Example 4 change:** the `1d` variant is now a pitch-plane slice with two driven wheels at ±α. With a
+single wheel on top, the head can pivot on that wheel's contact, which is a different, doubly unstable
+system, so gains tuned on it wouldn't transfer to BB-8.
+
 ## Module 2: MJCF generator
 
 | # | key | scene |
@@ -81,7 +138,7 @@ surface `friction`, `solref`, `solimp` and `condim`. Other contents of the modul
 | 1 | `inverted_pendulum` | cart-pole, or a cart plus gimbal pendulum on an XY stage (`variant="spherical"`) |
 | 2 | `single_omniwheel` | one omniwheel under a planar-constrained chassis (rolling vs lateral sliding) |
 | 3 | `kiwi_drive` | 3 omniwheels at 120°. `meta.kinematics["mixing_matrix"]` is `1/r [−sinθ cosθ R]` |
-| 4 | `planar_balancer` | `1d`: single wheel on the ball in the x–z plane. `2d`: 4 omniwheels, pitch + roll |
+| 4 | `planar_balancer` | `1d`: pitch-plane slice (two wheels at ±α, x–z plane). `2d`: 4 omniwheels, pitch + roll |
 | 5 | `bb8` | composite ball + omniwheel head, magnet preload, counterweight, target marker |
 
 ```python
@@ -116,11 +173,11 @@ never hard-code names.
   `mj_step` into its stages (`mj_fwdPosition` → realign each wheel contact frame so that tangent 1 is the
   rolling direction → `mj_makeConstraint`/`mj_projectConstraint` → velocity stage → `mj_step2`).
 
-Both models are checked against the analytic kinematics in the tests. Measured on this machine (BB-8,
-3 wheels): sub-roller at dt = 1 ms costs about 0.05 s of wall time per simulated second, and
-contact-pair at dt = 2 ms about 0.02 s. That is roughly a 2.5× speed-up, much of it from the larger
-stable timestep. The Python-level frame alignment limits the gain, so it is not the 10× the spec hoped
-for.
+Both models are checked against the analytic kinematics in the tests, and both run at 500 Hz. In the
+tests, sub-roller contacts show about 5% micro-slip. Measured during Module 2 (BB-8, 3 wheels):
+sub-roller at dt = 1 ms cost about 0.05 s of wall time per simulated second, and contact-pair at
+dt = 2 ms about 0.02 s, roughly a 2.5× speed-up. The Python-level frame alignment limits the gain,
+so it is not the 10× the spec hoped for.
 
 ### Magnetic preload
 

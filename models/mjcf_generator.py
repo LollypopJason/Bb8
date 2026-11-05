@@ -891,7 +891,8 @@ def _finish(b: MJCFBuilder, meta: SceneMetadata, extras: Optional[SceneExtras]) 
 def _default_sim(sim: Optional[SimulationParams], subroller: bool) -> SimulationParams:
     if sim is not None:
         return sim
-    return SimulationParams(timestep=0.001 if subroller else 0.002)
+    # 500 Hz for both omniwheel models (sub-roller scenes are also stable at 1 ms).
+    return SimulationParams(timestep=0.002)
 
 
 def _ground_height(terrain: TerrainParams, x: float = 0.0, y: float = 0.0) -> float:
@@ -969,11 +970,11 @@ def build_inverted_pendulum(
          size=(2.2 * p.pole_radius,), mass=p.tip_mass, material="mat_accent", contype=0, conaffinity=0)
     imu_site, imu_sensors = _add_imu(b, pole, "pole", (0, 0, p.pole_length))
 
-    acts = [_add_actuator(b, slide_x, MotorParams(torque_limit=p.force_limit, gear_ratio=1.0), name="cart_force_x")]
+    acts = [_add_actuator(b, slide_x, MotorParams(control_mode=ControlMode.TORQUE, torque_limit=p.force_limit, gear_ratio=1.0), name="cart_force_x")]
     _add_joint_sensors(b, slide_x, acts[0], "cart_x")
     _add_joint_sensors(b, hinge_y, None, "pole_pitch")
     if p.variant == "spherical":
-        acts.append(_add_actuator(b, joints["cart_y"], MotorParams(torque_limit=p.force_limit, gear_ratio=1.0),
+        acts.append(_add_actuator(b, joints["cart_y"], MotorParams(control_mode=ControlMode.TORQUE, torque_limit=p.force_limit, gear_ratio=1.0),
                                   name="cart_force_y"))
         _add_joint_sensors(b, joints["cart_y"], acts[1], "cart_y")
         _add_joint_sensors(b, joints["pole_roll"], None, "pole_roll")
@@ -1215,10 +1216,10 @@ def build_planar_balancer(
     sim: Optional[SimulationParams] = None,
     extras: Optional[SceneExtras] = None,
 ) -> SceneBundle:
-    """``1d``: wheel + body balancing on the ball in the x-z plane. ``2d``: 4 omniwheels, pitch & roll, no yaw."""
+    """``1d``: pitch-plane slice (two wheels at +-alpha, x-z plane). ``2d``: 4 omniwheels, pitch & roll, no yaw."""
     p = params or PlanarBalancerParams()
     p.validate()
-    sub = p.variant == "2d" and OmniwheelMode(p.wheel.mode) == OmniwheelMode.SUBROLLER
+    sub = OmniwheelMode(p.wheel.mode) == OmniwheelMode.SUBROLLER
     sim = _default_sim(sim, sub)
     if sim.terrain.floor_slope_deg and p.variant == "1d" and sim.terrain.slope_axis == "x":
         raise ValueError("a 1D (x-z plane) balancer cannot use a floor sloped about the x axis")
@@ -1228,10 +1229,10 @@ def build_planar_balancer(
     R = p.ball.r2
     meta = SceneMetadata(
         example="planar_balancer",
-        title=f"Example 4: {'1D single-wheel' if p.variant == '1d' else '2D decoupled'} ball balancer",
+        title=f"Example 4: {'1D planar-slice' if p.variant == '1d' else '2D decoupled'} ball balancer",
         description="Simplified balancer on the composite sphere for PID gain tuning before full 3D coupling.",
         timestep=sim.timestep, control_dt=0.01,
-        omni_mode=OmniwheelMode(p.wheel.mode).value if p.variant == "2d" else None,
+        omni_mode=OmniwheelMode(p.wheel.mode).value,
         control_mode=ControlMode(p.motor.control_mode).value,
     )
     nrm = _floor_normal(sim.terrain)
@@ -1260,33 +1261,29 @@ def build_planar_balancer(
     imu_site, _ = _add_imu(b, head, "head", (0, 0, p.com_height))
     wheels: List[WheelMeta] = []
     if p.variant == "1d":
-        rw = p.wheel_radius
-        hub_name = b.claim("wheel0_hub")
-        hub = _sub(head, "body", name=hub_name, pos=(0, 0, rw))
-        jn = b.claim("wheel0_drive")
-        _sub(hub, "joint", name=jn, type="hinge", axis=(0, 1, 0), damping=p.motor.joint_damping,
-             armature=p.motor.armature, frictionloss=p.motor.frictionloss)
-        Ixx, _, Izz = solid_cylinder_inertia(p.wheel_mass, rw, p.wheel_width)
-        _sub(hub, "inertial", pos=(0, 0, 0), mass=p.wheel_mass, diaginertia=(Ixx, Izz, Ixx))
-        gname = b.claim("wheel0_tire")
-        _sub(hub, "geom", name=gname, type="cylinder", size=(rw, 0.5 * p.wheel_width), euler=(math.pi / 2, 0, 0),
-             material="mat_dark", contype=CollisionBits.BALL_ROLLER[0], conaffinity=CollisionBits.BALL_ROLLER[1],
-             condim=3, friction=(p.wheel_friction, 0.005, 0.0001), density=0)
-        _sub(hub, "geom", class_="visual", type="box", size=(0.7 * rw, 0.52 * p.wheel_width, 0.08 * rw),
-             material="mat_accent")
-        site = b.claim("wheel0_frame")
-        _sub(head, "site", name=site, pos=(0, 0, rw), size=(0.004,), group=5)
-        act = _add_actuator(b, jn, p.motor, name="wheel0_motor")
-        enc = _add_joint_sensors(b, jn, act, "wheel0_enc")
-        wheels.append(WheelMeta(
-            index=0, joint=jn, actuator=act, hub_body=hub_name, mount_body="head", frame_site=site,
-            collision_geoms=[gname], target_geom=ball_geom, radius=rw, azimuth=0.0, axle=(0.0, 1.0, 0.0),
-            rolling_dir=(1.0, 0.0, 0.0), normal=(0.0, 0.0, 1.0), encoder_pos_sensor=enc[0],
-            encoder_vel_sensor=enc[1], torque_sensor=enc[2],
-        ))
+        # Pitch-plane slice of the ball-balancer: two driven wheels at +-alpha in the
+        # x-z plane. Two contacts with x-components keep the head rotating about the
+        # ball centre exactly like the 3/4-wheel head (a single top wheel would let
+        # the head pivot on its contact - a different, double-inverted system).
+        wp = dataclasses.replace(p.wheel, radius=p.wheel_radius, width=p.wheel_width, hub_mass=p.wheel_mass,
+                                 mu_tangent=p.wheel_friction)
+        alpha = math.radians(p.zenith_angle_deg)
+        top = np.array([0.0, 0.0, R])
+        for i, sgn in enumerate((1.0, -1.0)):
+            n = np.array([sgn * math.sin(alpha), 0.0, math.cos(alpha)])
+            t = np.array([math.cos(alpha), 0.0, -sgn * math.sin(alpha)])      # in-plane rolling direction
+            center = (R + wp.radius) * n - top
+            wheels.append(_add_omniwheel(
+                b, head, "head", f"wheel{i}", center=center, normal=n, rolling_dir=t, wheel=wp, motor=p.motor,
+                target_geoms=[ball_geom], roller_bits=CollisionBits.BALL_ROLLER,
+                pair_geom_bits=CollisionBits.BALL_PAIR_WHEEL, index=i, azimuth=0.0 if sgn > 0 else math.pi,
+            ))
+            _sub(head, "geom", class_="visual", type="capsule",
+                 fromto=np.concatenate([[0, 0, 0.012], center]), size=(0.006,), material="mat_metal")
         meta.init_qpos = {joints["head_pitch"]: math.radians(p.initial_tilt_deg)}
-        meta.kinematics = {"wheel_radius": rw, "ball_radius": R,
-                           "note": "no-slip: r_w * dphi_wheel = -R * (dphi_ball - dtheta_head) along x"}
+        J = [(-(R / wp.radius) * np.asarray(w.axle)).tolist() for w in wheels]
+        meta.kinematics = {"wheel_radius": wp.radius, "ball_radius": R, "ball_to_wheel_jacobian": J,
+                           "note": "both axles are +y: omega_w = -(R/r) (Omega_ball - Omega_head)_y"}
     else:
         hp = HeadUnitParams(num_wheels=4, zenith_angle_deg=p.zenith_angle_deg, azimuth_offset_deg=0.0,
                             wheel=p.wheel, motor=p.motor, chassis_mass=p.body_mass, com_height=p.com_height)

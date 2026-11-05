@@ -47,6 +47,13 @@ __all__ = [
     "ControlMode",
     "RollerShape",
     "MotorParams",
+    "nema17_direct_drive",
+    "EncoderParams",
+    "ImuNoiseParams",
+    "BallSensorNoiseParams",
+    "LatencyParams",
+    "ControlLoopParams",
+    "HardwareProfile",
     "OmniwheelParams",
     "MagneticPreloadParams",
     "CounterweightParams",
@@ -457,22 +464,39 @@ class RollerShape(str, enum.Enum):
 
 @dataclass
 class MotorParams:
-    """DC gear-motor model, values on the *motor* side of the gearbox.
+    """Wheel drive model. Values are on the *motor* side of the gearbox.
+
+    Default: a standard **NEMA 17 stepper (17HS19-2004S1, 2.0 A, 0.59 N m
+    holding torque, rotor 82 g cm^2) at 24 V in direct drive**, limited to the
+    prototype's wheel-side targets of 0.44 N m peak torque and 180 RPM
+    (18.85 rad/s). A stepper is commanded by step rate, so the default actuator
+    is a stiff velocity servo whose force range follows the pull-out torque
+    curve (flat up to ``pullout_corner_speed``, then ``~1/omega``); if the load
+    exceeds it the wheel falls behind, which approximates missed steps.
 
     ``wheel torque = gear_ratio * ctrl`` for torque mode. The reflected rotor
     inertia ``rotor_inertia * gear_ratio^2`` becomes the joint ``armature``.
     """
 
-    control_mode: ControlMode = ControlMode.TORQUE
-    torque_limit: float = 0.25           # motor-shaft torque limit [N m]
-    gear_ratio: float = 10.0
-    rotor_inertia: float = 2.0e-6        # [kg m^2] motor-side
-    max_wheel_speed: float = 60.0        # [rad/s] wheel side (velocity ctrlrange)
-    joint_damping: float = 0.002         # wheel joint viscous damping [N m s/rad]
+    control_mode: ControlMode = ControlMode.VELOCITY
+    torque_limit: float = 0.44           # peak (pull-out) motor-shaft torque [N m]
+    gear_ratio: float = 1.0              # direct drive
+    rotor_inertia: float = 8.2e-6        # [kg m^2] motor-side (17HS19-2004S1 datasheet)
+    # Joint armature used in simulation. ``None`` -> rotor_inertia * gear^2.
+    # Default 0.0008 kg m^2 (prototype spec): the bare direct-drive rotor (8.2e-6)
+    # plus a ~25 g cm^2 wheel is too light for a stiff stepper servo at a 2 ms
+    # timestep (MuJoCo solves contacts with the explicit mass matrix, so the
+    # implicitly-integrated servo then injects energy into the wheel/ball
+    # coupling). 0.0008 is ~10 % of the ball load reflected to each wheel.
+    armature_override: Optional[float] = 0.0008
+    max_wheel_speed: float = 18.85       # [rad/s] wheel side (180 RPM, velocity ctrlrange)
+    pullout_corner_speed: float = 31.4   # [rad/s] motor side: torque starts to drop (~300 RPM @ 24 V)
+    joint_damping: float = 0.0005        # wheel joint viscous damping [N m s/rad]
     frictionloss: float = 0.0            # wheel joint Coulomb friction [N m]
-    kv: float = 0.5                      # velocity-actuator gain [N m s/rad] (wheel side)
+    kv: float = 0.6                      # velocity-servo stiffness [N m s/rad] (wheel side)
     kp: float = 5.0                      # position-actuator gain [N m/rad] (wheel side)
     position_kv: float = 0.1             # damping for position actuator [N m s/rad]
+    motor_model: str = "NEMA17 17HS19-2004S1 @ 24 V, direct drive"
 
     @property
     def wheel_torque_limit(self) -> float:
@@ -480,15 +504,136 @@ class MotorParams:
 
     @property
     def armature(self) -> float:
+        if self.armature_override is not None:
+            return float(self.armature_override)
         return self.rotor_inertia * self.gear_ratio**2
+
+    def pullout_wheel_torque(self, wheel_speed: Any) -> Any:
+        """Available wheel-side torque at ``wheel_speed`` [rad/s] (works on arrays)."""
+        w_motor = np.abs(np.asarray(wheel_speed, dtype=float)) * self.gear_ratio
+        corner = max(self.pullout_corner_speed, 1e-9)
+        scale = np.where(w_motor <= corner, 1.0, corner / np.maximum(w_motor, 1e-9))
+        out = self.wheel_torque_limit * scale
+        return float(out) if np.ndim(out) == 0 else out
 
     def validate(self) -> None:
         if self.torque_limit <= 0 or self.gear_ratio <= 0:
             raise ValueError("torque_limit and gear_ratio must be positive")
         if self.rotor_inertia < 0 or self.joint_damping < 0 or self.frictionloss < 0:
             raise ValueError("rotor_inertia, joint_damping and frictionloss must be >= 0")
-        if self.max_wheel_speed <= 0:
-            raise ValueError("max_wheel_speed must be positive")
+        if self.max_wheel_speed <= 0 or self.pullout_corner_speed <= 0:
+            raise ValueError("max_wheel_speed and pullout_corner_speed must be positive")
+        if self.kv <= 0 or self.kp <= 0:
+            raise ValueError("servo gains must be positive")
+        if self.armature_override is not None and self.armature_override < 0:
+            raise ValueError("armature_override must be >= 0")
+
+
+def nema17_direct_drive(**overrides: Any) -> MotorParams:
+    """The default stepper drive with optional field overrides."""
+    return dataclasses.replace(MotorParams(), **overrides)
+
+
+@dataclass
+class EncoderParams:
+    """Wheel encoder (counts per *output shaft* revolution)."""
+
+    cpr: int = 1200
+    quantize: bool = True
+
+    @property
+    def resolution(self) -> float:
+        return 2.0 * math.pi / self.cpr
+
+    def validate(self) -> None:
+        if self.cpr < 4:
+            raise ValueError("encoder cpr must be >= 4")
+
+
+@dataclass
+class ImuNoiseParams:
+    """Head IMU noise (BNO085 / MPU6050 class)."""
+
+    gyro_noise_std: float = 0.005            # white noise [rad/s]
+    gyro_bias_std: float = 0.01              # per-episode constant offset std [rad/s]
+    gyro_bias_walk: float = 0.001            # bias random walk [rad/s / sqrt(s)]
+    orientation_noise_std: float = 0.003     # roll / pitch / yaw estimate noise [rad]
+    accel_noise_std: float = 0.03            # [m/s^2]
+
+    def validate(self) -> None:
+        if min(self.gyro_noise_std, self.gyro_bias_std, self.gyro_bias_walk, self.orientation_noise_std,
+               self.accel_noise_std) < 0:
+            raise ValueError("IMU noise parameters must be >= 0")
+
+
+@dataclass
+class BallSensorNoiseParams:
+    """Noise on the ball ground-truth / odometry channels."""
+
+    position_std: float = 0.003              # [m]
+    velocity_std: float = 0.01               # [m/s]
+    angular_velocity_std: float = 0.02       # [rad/s]
+
+    def validate(self) -> None:
+        if min(self.position_std, self.velocity_std, self.angular_velocity_std) < 0:
+            raise ValueError("ball sensor noise must be >= 0")
+
+
+@dataclass
+class LatencyParams:
+    """Sensor -> controller -> actuator pipeline delay (ring buffer, physics-step resolution)."""
+
+    delay: float = 0.010                     # [s], allowed range 0 .. 0.040
+
+    def validate(self) -> None:
+        if not (0.0 <= self.delay <= 0.040 + 1e-12):
+            raise ValueError("pipeline delay must be within [0, 40] ms")
+
+
+@dataclass
+class ControlLoopParams:
+    physics_timestep: float = 0.002          # 500 Hz
+    control_rate_hz: float = 100.0           # policy / controller rate
+
+    @property
+    def control_dt(self) -> float:
+        return 1.0 / self.control_rate_hz
+
+    @property
+    def frame_skip(self) -> int:
+        return max(1, int(round(self.control_dt / self.physics_timestep)))
+
+    def validate(self) -> None:
+        if self.physics_timestep <= 0 or self.control_rate_hz <= 0:
+            raise ValueError("timestep and control rate must be positive")
+        if self.control_dt < self.physics_timestep - 1e-12:
+            raise ValueError("control period must be at least one physics step")
+
+
+@dataclass
+class HardwareProfile:
+    """Sim-to-real hardware model shared by the env, controllers and studio."""
+
+    motor: MotorParams = field(default_factory=MotorParams)
+    encoder: EncoderParams = field(default_factory=EncoderParams)
+    imu: ImuNoiseParams = field(default_factory=ImuNoiseParams)
+    ball_sensors: BallSensorNoiseParams = field(default_factory=BallSensorNoiseParams)
+    latency: LatencyParams = field(default_factory=LatencyParams)
+    loop: ControlLoopParams = field(default_factory=ControlLoopParams)
+    noise_enabled: bool = True
+    latency_enabled: bool = True
+    torque_speed_curve: bool = True
+
+    @property
+    def delay_steps(self) -> int:
+        """Pipeline delay in physics steps (0 when latency is disabled)."""
+        if not self.latency_enabled:
+            return 0
+        return int(round(self.latency.delay / self.loop.physics_timestep))
+
+    def validate(self) -> None:
+        for part in (self.motor, self.encoder, self.imu, self.ball_sensors, self.latency, self.loop):
+            part.validate()
 
 
 @dataclass
@@ -951,8 +1096,7 @@ class SingleOmniwheelParams:
     free_yaw: bool = False                        # True: staggered roller rows can yaw the chassis
     wheel: OmniwheelParams = field(default_factory=lambda: OmniwheelParams(radius=0.04, width=0.03))
     motor: MotorParams = field(
-        default_factory=lambda: MotorParams(control_mode=ControlMode.VELOCITY, torque_limit=0.3, gear_ratio=10.0,
-                                            kv=0.8)
+        default_factory=MotorParams
     )
 
     def validate(self) -> None:
@@ -972,8 +1116,7 @@ class KiwiDriveParams:
     wheel_angles_deg: Tuple[float, float, float] = (90.0, 210.0, 330.0)
     wheel: OmniwheelParams = field(default_factory=lambda: OmniwheelParams(radius=0.035, width=0.025))
     motor: MotorParams = field(
-        default_factory=lambda: MotorParams(control_mode=ControlMode.VELOCITY, torque_limit=0.3, gear_ratio=10.0,
-                                            kv=0.8)
+        default_factory=MotorParams
     )
 
     @property
@@ -997,7 +1140,12 @@ class KiwiDriveParams:
 
 @dataclass
 class PlanarBalancerParams:
-    """Example 4: single-wheel (1D, planar) or decoupled 4-omniwheel (2D) balancer."""
+    """Example 4: planar-slice (1D) or decoupled 4-omniwheel (2D) balancer.
+
+    ``1d`` keeps ball and head in the x-z plane with two driven wheels at
+    +-``zenith_angle_deg`` (one "virtual wheel" in the pitch plane), so pitch
+    gains tuned here transfer to the BB-8 inner loop.
+    """
 
     variant: str = "1d"                           # "1d": x-z plane, "2d": pitch+roll, no yaw
     ball: CompositeBallParams = field(default_factory=CompositeBallParams)
@@ -1008,7 +1156,7 @@ class PlanarBalancerParams:
     wheel_width: float = 0.025
     wheel_mass: float = 0.08
     wheel_friction: float = 1.2
-    zenith_angle_deg: float = 45.0                # for the 2d variant
+    zenith_angle_deg: float = 45.0                # wheel contact angle from vertical
     wheel: OmniwheelParams = field(default_factory=OmniwheelParams)  # 2d variant omniwheels
     motor: MotorParams = field(default_factory=MotorParams)
     initial_tilt_deg: float = 2.0
@@ -1111,7 +1259,7 @@ def load_params_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
     registry = {c.__name__: c for c in (
-        CompositeBallParams, HeadUnitParams, SimulationParams, PendulumParams, SingleOmniwheelParams,
+        CompositeBallParams, HeadUnitParams, SimulationParams, HardwareProfile, PendulumParams, SingleOmniwheelParams,
         KiwiDriveParams, PlanarBalancerParams, BB8Params,
     )}
     cls = registry[payload["type"]]
